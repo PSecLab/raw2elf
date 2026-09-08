@@ -24,12 +24,15 @@ conclusion so a wrong answer can be traced rather than merely disbelieved.
 ## The short version
 
 ```bash
-pip install capstone
-python -m raw2elf firmware.bin -o firmware.elf
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m raw2elf firmware.bin -o firmware.elf
 ```
 
 Python 3.10 or newer and [Capstone](https://www.capstone-engine.org/) are the
-whole dependency list. Capstone does the instruction decoding; everything else
+whole dependency list. Install them into a virtual environment rather than
+system-wide, so a Capstone version bump for one project cannot change what
+another project decodes. Capstone does the instruction decoding; everything else
 is a small static-analysis framework built on top of it. There is deliberately
 no angr, no symbolic execution, no LLVM IR, and no Ghidra-as-a-library.
 

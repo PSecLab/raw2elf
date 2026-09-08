@@ -10,8 +10,9 @@ conclusion so a wrong answer can be traced rather than merely disbelieved.
 
 ```bash
 git clone https://github.com/PSecLab/raw2elf.git && cd raw2elf
-pip install -r requirements.txt
-python -m raw2elf firmware.bin -o firmware.elf
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python -m raw2elf firmware.bin -o firmware.elf
 ```
 
 Python 3.10+ and [Capstone](https://www.capstone-engine.org/) are the whole
@@ -60,6 +61,6 @@ raw2elf/                the package
 ## Tests
 
 ```bash
-python -m pytest           # 340 tests
-python -m raw2elf.eval     # graded correctness metrics
+.venv/bin/python -m pytest           # 340 tests
+.venv/bin/python -m raw2elf.eval     # graded correctness metrics
 ```

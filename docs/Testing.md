@@ -3,7 +3,7 @@
 ## Running the tests
 
 ```bash
-python -m pytest
+.venv/bin/python -m pytest
 ```
 
 340 tests. The package ships its own `pytest.ini` so the suite is independent
@@ -30,10 +30,10 @@ like a failure of the ELF rather than of the tool reading it.
 ## The evaluation harness
 
 ```bash
-python -m raw2elf.eval                          # the bundled reference corpus
-python -m raw2elf.eval firmware.elf other.elf   # any Cortex-M ELFs
-python -m raw2elf.eval --json report.json       # machine-readable results
-python -m raw2elf.eval --svd                    # include MCU identification
+.venv/bin/python -m raw2elf.eval                        # the bundled corpus
+.venv/bin/python -m raw2elf.eval firmware.elf other.elf # any Cortex-M ELFs
+.venv/bin/python -m raw2elf.eval --json report.json     # machine-readable
+.venv/bin/python -m raw2elf.eval --svd                  # include MCU matching
 ```
 
 The harness takes ELFs whose ground truth is known, renders each into every
