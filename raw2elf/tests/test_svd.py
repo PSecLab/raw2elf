@@ -368,12 +368,58 @@ def test_an_analyst_supplied_mcu_wins(standard, svd_root):
     assert mcu["match"].confidence == 1.0
 
 
-def test_an_unknown_mcu_name_is_reported_rather_than_ignored(standard, svd_root):
+def test_an_unmatched_mcu_name_widens_rather_than_giving_up(standard, svd_root):
+    """A name that places nothing must not cost the identification.
+
+    Some vendors' order codes diverge from their SVD names part way through,
+    so failing to place one says nothing about whether the accesses can
+    identify the part.
+    """
     reconstruction = reconstruct_bytes(
         standard.image, enable_svd=True, svd=str(svd_root), mcu="NOSUCHPART"
     )
-    assert reconstruction.context.get("mcu") is None
     assert any("NOSUCHPART" in warning for warning in reconstruction.context.warnings)
+    assert any("still matched against every device" in w for w in reconstruction.context.warnings)
+    # And identification still happened, from the accesses alone.
+    assert reconstruction.context.get("mcu") is not None
+
+
+@pytest.mark.parametrize(
+    ("typed", "reaches", "excludes"),
+    [
+        ("STM32G", "STM32G030", "STM32F030"),
+        ("STM32G4", "STM32G431xx", "STM32G030"),
+        ("STM32G474RET6", "STM32G474xx", "STM32G431xx"),
+        ("LPC1768", "LPC176x", None),
+    ],
+)
+def test_however_much_of_the_part_number_you_can_read(typed, reaches, excludes):
+    """A family answer stays in its family; a full order code narrows further."""
+    from raw2elf.analysis.devices import search
+
+    class Named:
+        def __init__(self, name):
+            self.name = name
+
+    catalogue = [
+        Named(name)
+        for name in ("STM32F030", "STM32G030", "STM32G431xx", "STM32G474xx", "LPC176x")
+    ]
+    found = {device.name for device in search(typed, catalogue)}
+    assert reaches in found, f"{typed} should reach {reaches}"
+    if excludes:
+        assert excludes not in found, f"{typed} should not reach {excludes}"
+
+
+def test_a_name_too_vague_to_act_on_matches_nothing():
+    from raw2elf.analysis.devices import search
+
+    class Named:
+        def __init__(self, name):
+            self.name = name
+
+    assert search("STM", [Named("STM32G474xx")]) == []
+    assert search("", [Named("STM32G474xx")]) == []
 
 
 # -- what a part number tells you ------------------------------------------

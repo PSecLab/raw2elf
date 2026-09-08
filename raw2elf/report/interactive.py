@@ -87,7 +87,7 @@ class TerminalSession(Interaction):
             # reading the binary, rather than leaving it under the list.
             self._say("")
             self._say("If you can read the part number off the chip, that settles it:")
-            self._say("  c) name the chip  (for example STM32F407VGT6)")
+            self._say("  c) name the chip  (even partly -- STM32G is enough)")
             self._say("")
             self._say("Otherwise, the addresses it weighed, best first:")
         self._say("")
@@ -140,7 +140,8 @@ class TerminalSession(Interaction):
 
         answer = self.ask_text(
             "What is printed on the chip?",
-            "for example STM32F407VGT6, nRF52840 or LPC1768; Enter to go back",
+            "as much as you can read is enough -- STM32G is as useful here as "
+            "STM32G474RET6; Enter to go back",
         )
         if not answer:
             return None

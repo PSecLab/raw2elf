@@ -21,6 +21,11 @@ from pathlib import Path
 from typing import Optional
 
 LAYOUTS = Path(__file__).with_name("device_layouts.json")
+#: Fewer shared characters than this is too vague to act on.
+MIN_SHARED = 4
+#: Agreement required stops growing past here, so a full order code still
+#: matches the shorter name an SVD file uses.
+FAMILY_DEPTH = 9
 
 
 @dataclass(frozen=True)
@@ -83,12 +88,18 @@ def known_families() -> list[str]:
     return sorted({entry["family"] for entry in _families()})
 
 
-def search(name: str, devices, limit: int = 8) -> list:
+def search(name: str, devices, limit: Optional[int] = None) -> list:
     """Devices from an SVD index whose names plausibly match ``name``.
 
-    Matching is loose on purpose: what is printed on a package carries
-    package and grade suffixes that no SVD file names, and an analyst should
-    not have to know which part of the string to type.
+    Matching is loose on purpose, in both directions. What is printed on a
+    package carries suffixes no SVD file names, and often only part of it is
+    legible; an analyst should not have to know which part to type, nor be
+    expected to read the whole thing.
+
+    ``limit`` is for display. Leave it unset when narrowing the search: a
+    family-level answer such as "STM32G" matches dozens of devices, and
+    cutting the list would silently exclude whole sub-families before the
+    recovered accesses ever got a say.
     """
     normalised = normalise(name)
     if not normalised:
@@ -100,19 +111,33 @@ def search(name: str, devices, limit: int = 8) -> list:
         if not candidate:
             continue
         shared = _common_prefix(normalised, candidate)
-        if shared < 4:
+        # How much agreement is required scales with how much was typed, so a
+        # family answer stays inside its family -- "STM32G4" must not reach
+        # STM32F0, which shares only "STM32". Beyond a few characters the
+        # requirement stops growing, because order codes and SVD names
+        # diverge in their tails: STM32G474RET6 should still find
+        # STM32G474xx, and nRF52840 should still find an SVD named nrf52.
+        required = max(MIN_SHARED, min(len(normalised), len(candidate), FAMILY_DEPTH))
+        if shared < required:
             continue
-        # Prefer the longest agreement, then the closest length: typing
-        # "STM32F407VG" should reach STM32F407 rather than STM32F4.
+        # Prefer the longest agreement, then the closest length.
         scored.append((-shared, abs(len(candidate) - len(normalised)), device))
+
     scored.sort(key=lambda item: (item[0], item[1], getattr(item[2], "name", "")))
-    return [device for _shared, _delta, device in scored[:limit]]
+    ordered = [device for _shared, _delta, device in scored]
+    return ordered if limit is None else ordered[:limit]
 
 
 def _common_prefix(left: str, right: str) -> int:
+    """Length of the shared prefix, treating ``X`` as a wildcard.
+
+    CMSIS-SVD names use it that way -- LPC176x, STM32G474xx, STM32F072x --
+    so a real part number would otherwise fail to match the file describing
+    it. Order codes occasionally carry it too, so it works from either side.
+    """
     length = 0
     for a, b in zip(left, right):
-        if a != b:
+        if a != b and a != "X" and b != "X":
             break
         length += 1
     return length

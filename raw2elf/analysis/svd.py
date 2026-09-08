@@ -740,14 +740,25 @@ class SvdMatcher(AnalysisPass):
             # What is printed on a package carries package, grade and speed
             # suffixes that no SVD file names, so matching is loose.
             wanted = context.options.mcu
-            devices = search(wanted, devices) or [
+            narrowed = search(wanted, devices) or [
                 device for device in devices if normalise(wanted) == normalise(device.name)
             ]
-            if not devices:
-                context.warn(f"no SVD device resembles --mcu {wanted!r}")
-                return
+            if narrowed:
+                devices = narrowed
+            else:
+                # Some vendors' order codes diverge from their SVD names part
+                # way through -- MK64FN1M0VLL12 against MK64F12 -- so failing
+                # to place a name is not a reason to give up on identifying
+                # the part from the accesses themselves.
+                context.warn(
+                    f"no CMSIS-SVD device is named like {wanted!r}, so the search was not "
+                    "narrowed; the recovered accesses are still matched against every device"
+                )
             context.log(
-                f"svd: {wanted} matched {', '.join(item.name for item in devices[:4])}", level=1
+                f"svd: {wanted} narrowed the search to {len(devices)} device(s): "
+                f"{', '.join(item.name for item in devices[:4])}"
+                + ("..." if len(devices) > 4 else ""),
+                level=1,
             )
 
         if len(accesses) == 0:

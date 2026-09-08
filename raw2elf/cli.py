@@ -185,7 +185,7 @@ def _ask_about_the_chip(session, options: Options) -> None:
 
     answer = session.ask_text(
         "What is printed on the chip? (Enter to skip; raw2elf will work it out)",
-        "for example STM32F407VGT6, nRF52840 or LPC1768",
+        "as much as you can read is enough -- STM32G, nRF52 and LPC17 all help",
     )
     if not answer:
         return
