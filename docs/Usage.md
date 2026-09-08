@@ -318,17 +318,41 @@ still wins on its own evidence — naming an STM32 does not drag an image linked
 at `0x10000000` to `0x08000000`. Suffixes are ignored, so the full order code
 off the package works; `--mcu` does the same thing without a session.
 
-Where recovery still cannot decide, the candidates are offered, and `c` goes
-back to naming the chip:
+Where recovery still cannot decide, naming the chip is offered first and the
+addresses it weighed come after, for whoever wants them:
 
 ```
+If you can read the part number off the chip, that settles it:
+  c) name the chip  (for example STM32F407VGT6)
+
+Otherwise, the addresses it weighed, best first:
+
   1) 0x07f00000  confidence 0.31  (backend seed)
        - handlers would lie up to 1.0 MiB past their own vector table
   2) 0x08000000  confidence 0.28
-  e) enter a value
-  c) name the chip instead, if you can read it off the board
+  e) enter a load address
+  c) name the chip
   q) abort
 ```
+
+A dump holding more than one program is the other thing worth asking about,
+and it is asked the same way — by what the options *are*, not by their offsets,
+with the safe answer first:
+
+```
+This dump appears to contain 2 separate programs.
+If you are not sure, press Enter and the whole dump will be used.
+
+  1) analyse the whole dump together  (recommended)
+  2) just the program at the very start of the dump, 32K
+  3) just the program 192K into the dump, 876K
+  q) abort
+```
+
+Only credible programs are offered: a candidate needs high confidence and at
+least 512 bytes, and if more than six qualify the question is dropped
+altogether in favour of the whole dump, with `--list-images` mentioned. A
+question with eleven answers is not a question anyone can answer.
 
 The remaining properties are worth knowing:
 

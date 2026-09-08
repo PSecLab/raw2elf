@@ -78,23 +78,36 @@ class TerminalSession(Interaction):
         shown = choices[:CHOICES_SHOWN]
         hidden = len(choices) - len(shown)
 
+        offers_chip = self.chip_prompt and subject == "runtime base address"
+
         self._say("")
         self._say(prompt or f"Cannot choose a {subject}.")
+        if offers_chip:
+            # Lead with the question that can actually be answered without
+            # reading the binary, rather than leaving it under the list.
+            self._say("")
+            self._say("If you can read the part number off the chip, that settles it:")
+            self._say("  c) name the chip  (for example STM32F407VGT6)")
+            self._say("")
+            self._say("Otherwise, the addresses it weighed, best first:")
         self._say("")
         for index, choice in enumerate(shown, start=1):
-            confidence = f"  confidence {choice.confidence:.2f}" if choice.confidence is not None else ""
+            # A confidence of 1.00 on every option tells the reader nothing.
+            confidence = (
+                f"  confidence {choice.confidence:.2f}"
+                if choice.confidence is not None and choice.confidence < 0.995
+                else ""
+            )
             origin = f"  ({choice.origin})" if choice.origin else ""
             self._say(f"  {index}) {choice.label}{confidence}{origin}")
             for line in choice.evidence[:EVIDENCE_SHOWN]:
                 self._say(f"       {line}")
         if hidden:
             self._say(f"  ... {hidden} further candidate(s) scored lower and are not shown")
-        self._say("  e) enter a value")
-        if self.chip_prompt and subject == "runtime base address":
-            # The question an analyst can actually answer. Where the firmware
-            # is loaded is a deduction; what the package says is an
-            # observation, and it implies the answer.
-            self._say("  c) name the chip instead, if you can read it off the board")
+        if custom:
+            self._say(f"  e) {custom}")
+        if offers_chip:
+            self._say("  c) name the chip")
         self._say("  q) abort")
 
         while True:
@@ -104,19 +117,20 @@ class TerminalSession(Interaction):
                 return None
             if answer == "":
                 answer = "1"
-            if answer.lower() == "c" and self.chip_prompt and subject == "runtime base address":
+            if answer.lower() == "c" and offers_chip:
                 picked = self._from_chip(choices)
                 if picked is not None:
                     return self._record(picked)
                 continue
-            if answer.lower() in ("e", "enter"):
+            if answer.lower() in ("e", "enter") and custom:
                 picked = self._read_custom(subject, choices)
                 if picked is not None:
                     return self._record(picked)
                 continue
             if answer.isdigit() and 1 <= int(answer) <= len(shown):
                 return self._record(shown[int(answer) - 1])
-            self._say(f"  not one of 1..{len(shown)}, e or q")
+            options = f"1..{len(shown)}" + (", e" if custom else "") + " or q"
+            self._say(f"  not one of {options}")
 
     # -- helpers ----------------------------------------------------------
 
@@ -172,7 +186,7 @@ class TerminalSession(Interaction):
         return None
 
     def _record(self, choice: Choice) -> Choice:
-        self._say(f"  using {choice.label}")
+        self._say(f"  -> {choice.label}")
         if choice.flag:
             self.chosen_flags.append(choice.flag)
         return choice

@@ -58,6 +58,7 @@ class EntryDiscovery(AnalysisPass):
                 for candidate in candidates
             ],
             relaxed,
+            custom=None,
         )
         context.provide("selected_entry_candidate", selected)
         context.provide("entry_confidence", selected.confidence)

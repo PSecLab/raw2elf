@@ -74,6 +74,7 @@ class BaseRecovery(AnalysisPass):
                 for candidate in candidates
             ],
             context.options,
+            custom="enter a load address",
         )
         # An analyst may answer with an address the analysis never proposed,
         # which is the whole point of being able to answer: they know

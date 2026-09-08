@@ -147,10 +147,11 @@ def test_a_multi_image_dump_offers_its_images(truth):
         [(0, truth["bootloader"].image), (0x8000, truth["application_high"].image)],
         size=0x10000,
     )
-    session = Scripted(["2"])  # the application
+    session = Scripted(["3"])  # 1 is the whole dump, 2 the bootloader
     result = reconstruct(ingest.parse(dump), _options(session))
 
-    assert "candidate images found" in session.output
+    assert "contain 2 separate programs" in session.output
+    assert "the program at the very start of the dump" in session.output
     assert result.runtime_base == truth["application_high"].base
     assert session.chosen_flags == ["--image 1"]
 
@@ -162,7 +163,7 @@ def test_declining_the_image_choice_analyses_the_whole_dump(truth):
         [(0, truth["bootloader"].image), (0x8000, truth["application_high"].image)],
         size=0x10000,
     )
-    session = Scripted(["3"])  # "the whole dump as one image"
+    session = Scripted(["1"])  # "analyse the whole dump together", the default
     result = reconstruct(ingest.parse(dump), _options(session))
     assert result.runtime_base == truth["bootloader"].base
     assert session.chosen_flags == []
@@ -171,7 +172,31 @@ def test_declining_the_image_choice_analyses_the_whole_dump(truth):
 def test_a_single_image_dump_is_not_worth_asking_about(standard):
     session = Scripted([])
     reconstruct(ingest.parse(standard.image), _options(session))
-    assert "candidate images" not in session.output
+    assert "separate programs" not in session.output
+
+
+def test_pressing_enter_takes_the_whole_dump(truth):
+    """The default has to be the answer that is right when unsure."""
+    from raw2elf.eval import corpus
+
+    dump = corpus.flash_dump(
+        [(0, truth["bootloader"].image), (0x8000, truth["application_high"].image)],
+        size=0x10000,
+    )
+    session = Scripted([""])
+    result = reconstruct(ingest.parse(dump), _options(session))
+    assert result.runtime_base == truth["bootloader"].base
+    assert session.chosen_flags == []
+
+
+def test_stray_matches_are_never_offered_as_programs(truth):
+    """A hundred bytes of constant data is not something to choose between."""
+    from raw2elf.analysis.carving import MIN_OFFERABLE_IMAGE, OFFER_CONFIDENCE
+
+    assert MIN_OFFERABLE_IMAGE >= 512
+    assert OFFER_CONFIDENCE >= 0.9
+    # The bundled bootloader is a real program and must stay offerable.
+    assert len(truth["bootloader"].image) >= MIN_OFFERABLE_IMAGE
 
 
 # -- the session hands off to a scripted run -------------------------------

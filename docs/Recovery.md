@@ -65,6 +65,29 @@ shifted off them. Because a resynchronizing sweep also walks data and produces
 some spurious call targets, the test is discounted by how many hits that noise
 explains by chance: only agreement beyond the expected coincidence rate scores.
 
+### Telling a table from data that resembles one
+
+Constant tables produce convincing near-misses, and a scan over a few megabytes
+finds plenty. Three rules do most of the work of rejecting them:
+
+**The initial stack pointer must be in internal SRAM.** External memory needs
+its controller configured, which has not happened when the reset vector is
+taken, so a stack pointer cannot live there — and the external window is
+exactly where stray constants land.
+
+**Evidence is counted against chance.** Carrying the Thumb bit is a one-bit
+test, so half of any random data passes it: five of nine exception vectors
+looking like handlers is what noise produces, not what a table looks like.
+Only the excess over the chance rate scores.
+
+**The table's offset must be one VTOR could address.** VTOR ignores the low
+seven bits and an image's base is at least that aligned, so a real table sits
+at a 128-byte-aligned offset within its image. Data that happens to resemble a
+table lands anywhere.
+
+On a real dump where floating-point tables and string data had been scoring as
+high as 0.92, these leave only the genuine images standing.
+
 ### Cortex-M specifics
 
 The backend adds four checks that need instruction semantics or the ARMv7-M

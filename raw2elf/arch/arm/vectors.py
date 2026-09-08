@@ -61,6 +61,14 @@ def next_power_of_two(value: int) -> int:
     return result
 
 _EMPTY_WORDS = frozenset((0x00000000, 0xFFFFFFFF))
+#: Where internal SRAM lives. The initial stack pointer must be in here,
+#: because nothing else is usable before reset code runs.
+INTERNAL_SRAM = (0x20000000, 0x40000000)
+#: SRAM some vendors place in the architectural code region.
+VENDOR_SRAM = (0x10000000, 0x20000000)
+#: Share of random words that pass a one-bit test, used to discount evidence
+#: down to what exceeds chance.
+CHANCE = 0.5
 #: Granularities a linker plausibly uses for a firmware image's base.
 BASE_ALIGNMENTS: tuple[int, ...] = (
     0x1000000, 0x100000, 0x40000, 0x20000, 0x10000, 0x8000,
@@ -187,9 +195,13 @@ def plausible_stack_pointer(value: int, classify) -> bool:
         return False
     # Vendors place SRAM in the architectural code region as well (CCM on
     # STM32F4, the LPC17xx main SRAM), so both windows are accepted.
-    if 0x10000000 <= value < 0x20000000:
+    if VENDOR_SRAM[0] <= value < VENDOR_SRAM[1]:
         return True
-    return classify(value) == AddressClass.RAM
+    # Internal SRAM only. External memory needs its controller configured,
+    # which has not happened when the reset vector is taken, so an initial
+    # stack pointer cannot live there -- and the external window is where
+    # stray constants most often land.
+    return INTERNAL_SRAM[0] <= value < INTERNAL_SRAM[1]
 
 
 def plausible_handler(value: int, classify) -> bool:
@@ -282,28 +294,47 @@ def score_table(table: VectorTable, remaining_bytes: int, classify) -> None:
     score += 2.0
 
     handlers = table.handler_addresses
-    named = [slot for slot in table.handler_slots if slot in CORE_VECTORS and slot != 1]
-    if named:
-        score += min(len(named), 9) * 0.35
+    # Carrying the Thumb bit is a one-bit test, so half of any random data
+    # passes it. Only the excess over that counts: nine of nine named vectors
+    # is a real table, five of nine is what noise looks like.
+    named_slots = [slot for slot in CORE_VECTORS if slot != 1 and slot < table.word_count]
+    named = [slot for slot in named_slots if slot in table.handler_slots]
+    if named_slots:
+        excess = len(named) - CHANCE * len(named_slots)
+        weight = max(excess, 0.0) * 0.7
+        score += weight if excess > 0 else excess * 0.5
         evidence.append(
             Evidence(
                 kind="core_vectors",
                 source=source,
-                explanation=f"{len(named)} architecturally named exception vectors carry the Thumb bit",
+                explanation=(
+                    f"{len(named)} of {len(named_slots)} architecturally named exception vectors "
+                    f"carry the Thumb bit, against {CHANCE * len(named_slots):.1f} expected by chance"
+                ),
                 value=len(named),
-                weight=min(len(named), 9) * 0.35,
+                weight=abs(weight),
+                supports=excess > 0,
             )
         )
 
-    device_handlers = [slot for slot in table.handler_slots if slot >= FIRST_DEVICE_IRQ]
-    if device_handlers:
-        bonus = min(len(device_handlers), 32) * 0.08
+    device_slots = [
+        slot
+        for slot in range(FIRST_DEVICE_IRQ, table.word_count)
+        if table.words[slot] not in _EMPTY_WORDS
+    ]
+    device_handlers = [slot for slot in device_slots if slot in table.handler_slots]
+    if device_slots:
+        excess = len(device_handlers) - CHANCE * len(device_slots)
+        bonus = min(max(excess, 0.0) * 0.08, 2.5)
         score += bonus
         evidence.append(
             Evidence(
                 kind="device_vectors",
                 source=source,
-                explanation=f"{len(device_handlers)} device interrupt vectors carry the Thumb bit",
+                explanation=(
+                    f"{len(device_handlers)} of {len(device_slots)} device interrupt vectors carry "
+                    "the Thumb bit"
+                ),
                 value=len(device_handlers),
                 weight=bonus,
             )
@@ -464,6 +495,24 @@ def score_table(table: VectorTable, remaining_bytes: int, classify) -> None:
                 ),
                 value=table.image_offset,
                 weight=0.75,
+            )
+        )
+    else:
+        # VTOR ignores the low seven bits, and an image's own base is at
+        # least that aligned, so a real table cannot sit at an offset like
+        # this. Data that happens to look like a table lands anywhere.
+        score -= 3.0
+        evidence.append(
+            Evidence(
+                kind="alignment",
+                source=source,
+                explanation=(
+                    f"table offset {table.image_offset:#x} is not {VTOR_ALIGNMENT:#x}-byte "
+                    "aligned, so VTOR could not address a table here"
+                ),
+                value=table.image_offset,
+                weight=3.0,
+                supports=False,
             )
         )
 

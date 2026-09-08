@@ -21,6 +21,23 @@ from ..core.pipeline import AnalysisContext, AnalysisPass
 from ..core.util import human_size
 
 
+#: Confidence a candidate needs before it is worth putting to a person.
+OFFER_CONFIDENCE = 0.9
+#: Smaller than this is not a program worth reconstructing on its own. Real
+#: bootloaders get down to a few hundred bytes; the stray matches that turn up
+#: in constant tables are smaller still.
+MIN_OFFERABLE_IMAGE = 512
+#: More options than this is not a question anyone can answer.
+MAX_OFFERED = 6
+
+
+def _where(offset: int, total: int) -> str:
+    """Describe a position in a dump without requiring hex to be read."""
+    if offset == 0:
+        return "the program at the very start of the dump"
+    return f"the program {human_size(offset)} into the dump"
+
+
 @dataclass(frozen=True)
 class PaddingRun:
     """A run of one repeated byte."""
@@ -141,39 +158,58 @@ class ImageDiscovery(AnalysisPass):
         )
 
     def _ask(self, context: AnalysisContext, hypotheses) -> Optional[int]:
-        """Offer the images found, when there is a session and a real choice.
+        """Offer the programs found, in terms someone can answer.
 
-        Unlike the other decision points this one is not a refusal: analysing
-        the whole dump is a legitimate answer, and the default. But which
-        image an analyst wants is not something the bytes can say, so with
-        someone present it is worth asking.
+        Which program an analyst wants is not something the bytes can say, so
+        it is worth asking. But "pick a candidate image" is a question about
+        binaries, and the answer they need to give is about intent, so the
+        options are described by where they sit and how big they are, and
+        analysing everything together leads and is the default.
         """
         interaction = context.options.interaction
-        if interaction is None or len(hypotheses) < 2:
+        if interaction is None:
             return None
+
+        credible = [
+            (index, item)
+            for index, item in enumerate(hypotheses)
+            if item.confidence >= OFFER_CONFIDENCE and item.image_size >= MIN_OFFERABLE_IMAGE
+        ]
+        if len(credible) < 2 or len(credible) > MAX_OFFERED:
+            # Nothing worth asking about, or too many to be a real question;
+            # the whole dump is the right default either way.
+            if len(credible) > MAX_OFFERED:
+                interaction.note(
+                    f"  {len(credible)} separate programs look possible; analysing the whole "
+                    "dump. Use --list-images to see them."
+                )
+            return None
+
+        total = context.image.size
         choices = [
             Choice(
-                value=index,
-                label=f"offset 0x{item.image_offset:06x}  {human_size(item.image_size)}"
-                + (f"  entry 0x{item.entry:08x}" if item.entry is not None else ""),
-                confidence=item.confidence,
-                evidence=[str(line) for line in item.evidence[:3]],
-                flag=f"--image {index}",
-            )
-            for index, item in enumerate(hypotheses)
-        ]
-        choices.append(
-            Choice(
                 value=None,
-                label="the whole dump as one image",
-                origin="default",
+                label="analyse the whole dump together",
+                origin="recommended",
                 flag="",
             )
+        ]
+        choices.extend(
+            Choice(
+                value=index,
+                label=f"just {_where(item.image_offset, total)}, {human_size(item.image_size)}",
+                confidence=item.confidence,
+                flag=f"--image {index}",
+            )
+            for index, item in credible
         )
         picked = interaction.choose(
-            "firmware image",
+            "which program to reconstruct",
             choices,
-            prompt=f"{len(hypotheses)} candidate images found",
+            prompt=(
+                f"This dump appears to contain {len(credible)} separate programs.\n"
+                "If you are not sure, press Enter and the whole dump will be used."
+            ),
         )
         return None if picked is None else picked.value
 

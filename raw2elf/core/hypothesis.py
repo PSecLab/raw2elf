@@ -158,6 +158,7 @@ def resolve(
     choices: list["Choice"],
     options,
     ambiguity_margin: float = 0.15,
+    custom: Optional[str] = None,
 ) -> Any:
     """Pick a candidate, asking a person only if the evidence will not.
 
@@ -180,7 +181,7 @@ def resolve(
         interaction = getattr(options, "interaction", None)
         if interaction is None:
             raise
-        picked = interaction.choose(subject, choices, prompt=str(refusal))
+        picked = interaction.choose(subject, choices, prompt=str(refusal), custom=custom)
         if picked is None:
             raise
         return picked.value
