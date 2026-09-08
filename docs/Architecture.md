@@ -286,7 +286,7 @@ consider it.
 
 4. **Extend a corpus.** `eval/corpus.py` derives every input representation
    from an ELF and reads ground truth back out of it, both generically. Point
-   `python -m raw2elf.eval` at ELFs for your architecture and the same metrics
+   `.venv/bin/python -m raw2elf.eval` at ELFs for your architecture and the same metrics
    apply. See [Testing.md](Testing.md).
 
 What you should *not* need to do: touch `core/`, touch `analysis/`, or change

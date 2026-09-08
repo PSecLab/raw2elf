@@ -1,7 +1,7 @@
 # Reference firmwares
 
 Purpose-built Cortex-M firmwares with known ground truth, used by the test
-suite and by `python -m raw2elf.eval`. The ELFs are committed so that neither
+suite and by `.venv/bin/python -m raw2elf.eval`. The ELFs are committed so that neither
 needs a cross toolchain; re-run `./build.sh` (needs `arm-none-eabi-gcc`) only
 when `src/` changes.
 
