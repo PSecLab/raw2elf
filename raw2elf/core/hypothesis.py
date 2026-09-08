@@ -8,10 +8,13 @@ is made once, explicitly, against a confidence threshold.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .evidence import Evidence, confidence_label
 from .util import hexs
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .interaction import Choice
 
 
 @dataclass
@@ -148,6 +151,39 @@ class LowConfidenceError(RecoveryRefused):
             f"{value if isinstance(value, str) else hexs(value, 8)} has confidence "
             f"{confidence:.2f}, below the required {threshold:.2f}"
         )
+
+
+def resolve(
+    subject: str,
+    choices: list["Choice"],
+    options,
+    ambiguity_margin: float = 0.15,
+) -> Any:
+    """Pick a candidate, asking a person only if the evidence will not.
+
+    The unattended path is unchanged: rank, apply the threshold, and refuse
+    rather than guess. An interaction is consulted only once that refusal has
+    already been decided on, so being able to ask never lowers the bar for
+    deciding automatically -- it only changes what happens when the bar is
+    not met.
+    """
+    ranked = [(item.value, item.confidence or 0.0) for item in choices]
+    try:
+        return choose(
+            subject,
+            ranked,
+            minimum_confidence=options.minimum_confidence,
+            fail_on_ambiguity=options.fail_on_ambiguity,
+            ambiguity_margin=ambiguity_margin,
+        )
+    except RecoveryRefused as refusal:
+        interaction = getattr(options, "interaction", None)
+        if interaction is None:
+            raise
+        picked = interaction.choose(subject, choices, prompt=str(refusal))
+        if picked is None:
+            raise
+        return picked.value
 
 
 def choose(

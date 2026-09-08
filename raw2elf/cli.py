@@ -19,7 +19,7 @@ from .core.hypothesis import AmbiguityError, LowConfidenceError
 from .core.options import Options
 from .core.pipeline import AnalysisContext, Pipeline
 from .reconstruct import reconstruct
-from .report import console, manifest
+from .report import console, interactive, manifest
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -132,6 +132,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "-i",
+        "--interactive",
+        action="store_true",
+        help="ask instead of refusing when recovery cannot decide, and offer a "
+        "choice of image when the input holds more than one",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="count", default=0, help="explain the analysis (repeatable)"
     )
     parser.add_argument("--version", action="version", version=f"raw2elf {__version__}")
@@ -159,6 +166,17 @@ def options_from(arguments: argparse.Namespace) -> Options:
     )
     options.extra["trim_padding"] = not arguments.keep_padding
     return options
+
+
+def _reproduce(arguments: argparse.Namespace, session) -> str:
+    """The non-interactive command that repeats what the session chose."""
+    parts = ["raw2elf", str(arguments.firmware)]
+    parts.extend(session.chosen_flags)
+    if arguments.output:
+        parts.extend(["-o", str(arguments.output)])
+    if arguments.no_svd:
+        parts.append("--no-svd")
+    return " ".join(parts)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -208,6 +226,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if arguments.list_images:
         return _list_images(image, options)
 
+    session = None
+    if arguments.interactive:
+        try:
+            interactive.require_terminal()
+        except interactive.NotATerminal as error:
+            print(f"raw2elf: {error}", file=sys.stderr)
+            return EXIT_USAGE
+        session = interactive.TerminalSession()
+        options.interaction = session
+
     try:
         reconstruction = reconstruct(image, options)
     except (AmbiguityError, LowConfidenceError) as error:
@@ -234,6 +262,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         outputs.append(str(report_path))
 
     print(console.summary(reconstruction, outputs))
+    if session is not None and session.chosen_flags:
+        print()
+        print("Repeat without prompting:")
+        print(f"  {_reproduce(arguments, session)}")
     if arguments.verbose:
         print()
         print(console.evidence(reconstruction))

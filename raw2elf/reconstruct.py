@@ -15,6 +15,7 @@ from .arch.base import ArchitectureBackend, ProbeResult
 from .arch.registry import get_backend, probe_all
 from .core.evidence import Evidence
 from .core.hypothesis import LowConfidenceError, RecoveryRefused, choose
+from .core.interaction import Choice
 from .core.image import FirmwareImage
 from .core.options import Options
 from .core.pipeline import AnalysisContext, PipelineResult
@@ -81,7 +82,25 @@ def select_backend(
         # This happens before the pipeline builds a context, so the probe
         # results are attached directly.
         refusal.probes = probes
-        raise
+        if options.interaction is None:
+            raise
+        picked = options.interaction.choose(
+            "architecture",
+            [
+                Choice(
+                    value=probe.backend,
+                    label=probe.backend,
+                    confidence=probe.confidence,
+                    evidence=[str(item) for item in probe.evidence[:4]],
+                    flag=f"--arch {probe.backend}",
+                )
+                for probe in probes
+            ],
+            prompt=str(refusal),
+        )
+        if picked is None:
+            raise
+        name = picked.value
     confidence = next(probe.confidence for probe in probes if probe.backend == name)
     return get_backend(name), confidence, probes
 

@@ -10,11 +10,12 @@ input.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 from ..arch.base import ArchCapability
 from ..core.evidence import Evidence
 from ..core.hypothesis import ImageHypothesis
+from ..core.interaction import Choice
 from ..core.options import OptionError
 from ..core.pipeline import AnalysisContext, AnalysisPass
 from ..core.util import human_size
@@ -117,6 +118,8 @@ class ImageDiscovery(AnalysisPass):
 
         selection = context.options.image
         if selection is None:
+            selection = self._ask(context, hypotheses)
+        if selection is None:
             return
         if not 0 <= selection < len(hypotheses):
             raise OptionError(
@@ -136,6 +139,43 @@ class ImageDiscovery(AnalysisPass):
                 value=chosen.image_offset,
             )
         )
+
+    def _ask(self, context: AnalysisContext, hypotheses) -> Optional[int]:
+        """Offer the images found, when there is a session and a real choice.
+
+        Unlike the other decision points this one is not a refusal: analysing
+        the whole dump is a legitimate answer, and the default. But which
+        image an analyst wants is not something the bytes can say, so with
+        someone present it is worth asking.
+        """
+        interaction = context.options.interaction
+        if interaction is None or len(hypotheses) < 2:
+            return None
+        choices = [
+            Choice(
+                value=index,
+                label=f"offset 0x{item.image_offset:06x}  {human_size(item.image_size)}"
+                + (f"  entry 0x{item.entry:08x}" if item.entry is not None else ""),
+                confidence=item.confidence,
+                evidence=[str(line) for line in item.evidence[:3]],
+                flag=f"--image {index}",
+            )
+            for index, item in enumerate(hypotheses)
+        ]
+        choices.append(
+            Choice(
+                value=None,
+                label="the whole dump as one image",
+                origin="default",
+                flag="",
+            )
+        )
+        picked = interaction.choose(
+            "firmware image",
+            choices,
+            prompt=f"{len(hypotheses)} candidate images found",
+        )
+        return None if picked is None else picked.value
 
     def _build(self, context: AnalysisContext, candidates) -> list[ImageHypothesis]:
         image = context.image

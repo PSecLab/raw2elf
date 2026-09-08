@@ -253,6 +253,12 @@ Each of these prints and exits without writing anything.
 | `--detect` | Report input-format detection and each parser's opinion. |
 | `--probe` | Report architecture probe scores and their evidence. |
 
+### Interaction
+
+| Option | Effect |
+| --- | --- |
+| `-i`, `--interactive` | Ask instead of refusing, and offer a choice of image. See [Interactive sessions](#interactive-sessions). |
+
 ### Diagnostics
 
 `-v` prints the evidence behind the decisions, which is the first thing to
@@ -275,6 +281,63 @@ Evidence:
 
 Repeating `-v` adds per-pass timing. Everything shown here, and more, is in the
 [manifest](Manifest.md) regardless of verbosity.
+
+## Interactive sessions
+
+`-i` / `--interactive` turns a refusal into a question instead of an error.
+
+It is not a configuration wizard, and it does not walk you through settings the
+analysis can work out for itself: on a straightforward image it asks nothing at
+all. It speaks up in exactly two situations — where recovery would otherwise
+have refused, and where the input holds more than one firmware image, since
+which one you want is not something the bytes can say.
+
+```
+$ raw2elf odd.bin -o odd.elf --interactive
+
+best runtime base address candidate 0x07f00000 has confidence 0.31,
+below the required 0.50
+
+  1) 0x07f00000  confidence 0.31  (backend seed)
+       + vector table lands at 0x07f00000, aligned to 0x100000
+       - handlers would lie up to 1.0 MiB past their own vector table
+  2) 0x08000000  confidence 0.28  (reference value aligned to 0x1000000)
+       + all handlers lie within 0x318 bytes after their own vector table
+       - none of the 4 resolvable exception handlers decode as Thumb code
+  ... 6 further candidate(s) scored lower and are not shown
+  e) enter a value
+  q) abort
+Select runtime base address [1]: 2
+  using 0x08000000
+
+[...]
+
+Repeat without prompting:
+  raw2elf odd.bin --base 0x08000000 -o odd.elf
+```
+
+Four properties are worth knowing:
+
+**Being able to ask never lowers the bar for deciding.** The threshold and
+ambiguity rules run first and unchanged; a session is consulted only once a
+refusal has already been decided on. A run with `-i` reaches the same
+conclusions as one without, and simply has somewhere to go when there is no
+conclusion to reach.
+
+**`e` accepts an address the analysis never proposed.** That is the point of
+being asked: you may know the part, the datasheet or the boot configuration,
+none of which the image states.
+
+**`q`, or end-of-input, refuses exactly as an unattended run would** — same
+error, same exit code 3, nothing written.
+
+**It will not start without a terminal.** A piped or scheduled run would block
+on a prompt nobody can see, so `-i` with a non-terminal stdin is a usage error
+rather than a hang.
+
+The session ends by printing the equivalent non-interactive command, so
+whatever you settled interactively can go straight into a script. There is no
+session file to manage: the flags *are* the configuration.
 
 ## When it refuses
 

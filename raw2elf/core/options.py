@@ -7,7 +7,10 @@ separately from the inferred value so reports can say which is which.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .interaction import Interaction
 
 
 class OptionError(ValueError):
@@ -50,6 +53,9 @@ class Options:
     input_format: Optional[str] = None
     #: Emit ``.text``/``.rodata``-style splits when evidence justifies it.
     split_sections: bool = False
+    #: Someone to ask when the evidence does not decide. ``None`` means run
+    #: unattended: an undecidable point refuses rather than blocking.
+    interaction: Optional["Interaction"] = None
     extra: dict[str, object] = field(default_factory=dict)
 
     @property

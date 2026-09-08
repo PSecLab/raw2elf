@@ -25,7 +25,8 @@ import math
 from collections import Counter
 
 from ..core.evidence import Evidence, confidence_label
-from ..core.hypothesis import BaseCandidate, choose
+from ..core.hypothesis import BaseCandidate, resolve
+from ..core.interaction import Choice
 from ..core.pipeline import AnalysisContext, AnalysisPass
 from ..core.reference import ReferenceSet
 from ..core.util import align_down, logistic
@@ -53,14 +54,45 @@ class BaseRecovery(AnalysisPass):
         candidates = self._candidates(context)
         context.provide("base_candidates", candidates)
 
-        ranked = [(candidate.runtime_base, candidate.confidence) for candidate in candidates]
-        base = choose(
+        base = resolve(
             "runtime base address",
-            ranked,
-            minimum_confidence=context.options.minimum_confidence,
-            fail_on_ambiguity=context.options.fail_on_ambiguity,
+            [
+                Choice(
+                    value=candidate.runtime_base,
+                    label=f"0x{candidate.runtime_base:08x}",
+                    origin=candidate.origin,
+                    confidence=candidate.confidence,
+                    evidence=[str(item) for item in candidate.supporting[:4]]
+                    + [str(item) for item in candidate.contradicting[:3]],
+                    flag=f"--base 0x{candidate.runtime_base:08x}",
+                )
+                for candidate in candidates
+            ],
+            context.options,
         )
-        chosen = next(item for item in candidates if item.runtime_base == base)
+        # An analyst may answer with an address the analysis never proposed,
+        # which is the whole point of being able to answer: they know
+        # something the image does not say.
+        chosen = next(
+            (item for item in candidates if item.runtime_base == base),
+            None,
+        )
+        if chosen is None:
+            chosen = BaseCandidate(
+                runtime_base=base,
+                score=math.inf,
+                confidence=1.0,
+                origin="supplied during analysis",
+                supporting=[
+                    Evidence(
+                        kind="override",
+                        source=self.name,
+                        explanation=f"analyst chose base {base:#010x}, which was not a candidate",
+                        value=base,
+                    )
+                ],
+            )
+            candidates.insert(0, chosen)
         context.provide("runtime_base", base)
         context.provide("base_confidence", chosen.confidence)
         context.note(*chosen.supporting, *chosen.contradicting)

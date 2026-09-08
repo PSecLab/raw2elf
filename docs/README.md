@@ -82,4 +82,5 @@ behaviour:
 - **It does not invent section boundaries.** A conservative `.flash` beats a
   fabricated `.text`/`.rodata` split.
 - **It does not emit a confidently wrong ELF.** Where several answers are
-  plausible it reports them, with evidence, and exits non-zero.
+  plausible it reports them, with evidence, and exits non-zero. With `-i` it
+  asks instead, but being able to ask never lowers the bar for deciding.
