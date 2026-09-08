@@ -1,0 +1,368 @@
+"""SVD correlation: indexing, ranking, honest labelling, graceful absence."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from conftest import reconstruct_bytes
+from raw2elf.analysis import svd
+from raw2elf.core.reference import Access, AddressClass, Reference, ReferenceKind
+
+DEVICE_TEMPLATE = """\
+<?xml version="1.0" encoding="utf-8"?>
+<device schemaVersion="1.1">
+  <name>{name}</name>
+  <version>1.0</version>
+  <description>Synthetic device for tests</description>
+  <cpu>
+    <name>{cpu}</name>
+    <revision>r0p0</revision>
+    <endian>little</endian>
+  </cpu>
+  <addressUnitBits>8</addressUnitBits>
+  <width>32</width>
+  <size>32</size>
+  <access>read-write</access>
+  <peripherals>
+{peripherals}
+  </peripherals>
+</device>
+"""
+
+PERIPHERAL_TEMPLATE = """\
+    <peripheral>
+      <name>{name}</name>
+      <description>{name} block</description>
+      <groupName>{group}</groupName>
+      <baseAddress>0x{base:08X}</baseAddress>
+      <addressBlock>
+        <offset>0x0</offset>
+        <size>0x{size:X}</size>
+        <usage>registers</usage>
+      </addressBlock>
+{interrupt}
+      <registers>
+{registers}
+      </registers>
+    </peripheral>
+"""
+
+REGISTER_TEMPLATE = """\
+        <register>
+          <name>{name}</name>
+          <addressOffset>0x{offset:X}</addressOffset>
+          <size>32</size>
+          <access>{access}</access>
+        </register>
+"""
+
+INTERRUPT_TEMPLATE = """\
+      <interrupt>
+        <name>{name}</name>
+        <value>{value}</value>
+      </interrupt>
+"""
+
+
+def write_device(directory: Path, name: str, peripherals, cpu: str = "CM4") -> Path:
+    """Write a synthetic SVD file and return its path."""
+    rendered = []
+    for entry in peripherals:
+        registers = "".join(
+            REGISTER_TEMPLATE.format(
+                name=register_name, offset=offset, access=entry.get("access", "read-write")
+            )
+            for register_name, offset in entry["registers"]
+        )
+        interrupt = (
+            INTERRUPT_TEMPLATE.format(name=entry["name"], value=entry["irq"])
+            if "irq" in entry
+            else ""
+        )
+        rendered.append(
+            PERIPHERAL_TEMPLATE.format(
+                name=entry["name"],
+                group=entry.get("group", entry["name"]),
+                base=entry["base"],
+                size=entry.get("size", 0x400),
+                interrupt=interrupt,
+                registers=registers,
+            )
+        )
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{name}.svd"
+    path.write_text(
+        DEVICE_TEMPLATE.format(name=name, cpu=cpu, peripherals="".join(rendered))
+    )
+    return path
+
+
+#: A small STM32F4-shaped device, and two neighbours that share its map.
+def _standard_peripherals():
+    return [
+        {
+            "name": "RCC",
+            "base": 0x40023800,
+            "irq": 5,
+            "registers": [("CR", 0x00), ("CFGR", 0x08), ("AHB1ENR", 0x30), ("APB2ENR", 0x44)],
+        },
+        {
+            "name": "GPIOA",
+            "base": 0x40020000,
+            "registers": [("MODER", 0x00), ("OSPEEDR", 0x08), ("AFRL", 0x20)],
+        },
+        {
+            "name": "USART1",
+            "base": 0x40011000,
+            "irq": 37,
+            "registers": [("SR", 0x00), ("DR", 0x04), ("BRR", 0x08), ("CR1", 0x0C)],
+        },
+    ]
+
+
+@pytest.fixture
+def svd_root(tmp_path):
+    root = tmp_path / "svd"
+    write_device(root / "Acme", "ACME32F407", _standard_peripherals())
+    write_device(root / "Acme", "ACME32F405", _standard_peripherals())
+    write_device(root / "Clone", "CLN32F4", _standard_peripherals())
+    write_device(
+        root / "Other",
+        "OTHER100",
+        [
+            {
+                "name": "SYSCON",
+                "base": 0x40048000,
+                "registers": [("MEMREMAP", 0x00), ("SYSAHBCLKCTRL", 0x80)],
+            }
+        ],
+        cpu="CM0PLUS",
+    )
+    return root
+
+
+def _access(address: int, base: int, offset: int, access=Access.WRITE, width=32) -> Reference:
+    return Reference(
+        value=address,
+        source_offset=0,
+        derivation="recovered base + displacement",
+        kind=ReferenceKind.MMIO,
+        access=access,
+        width=width,
+        base_value=base,
+        offset_value=offset,
+        address_class=AddressClass.MMIO,
+    )
+
+
+ACCESSES = [
+    _access(0x40023800, 0x40023000, 0x800),
+    _access(0x40023808, 0x40023000, 0x808),
+    _access(0x40023830, 0x40023000, 0x830),
+    _access(0x40020000, 0x40020000, 0x00),
+    _access(0x40020020, 0x40020000, 0x20),
+    _access(0x40011008, 0x40011000, 0x08),
+    _access(0x4001100C, 0x40011000, 0x0C),
+    _access(0x40011000, 0x40011000, 0x00, access=Access.READ),
+]
+
+
+# -- indexing --------------------------------------------------------------
+
+
+def test_indexing_extracts_peripherals_interrupts_and_the_core(svd_root):
+    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
+    by_name = {item.name: item for item in devices}
+    assert set(by_name) == {"ACME32F407", "ACME32F405", "CLN32F4", "OTHER100"}
+
+    device = by_name["ACME32F407"]
+    assert device.vendor == "Acme"
+    assert device.cpu == "CM4"
+    assert device.bases == {0x40023800, 0x40020000, 0x40011000}
+    assert device.peripheral_for(0x40020020).name == "GPIOA"
+    assert device.peripheral_for(0x40FFFFFF) is None
+    assert {item.value: item.name for item in device.interrupts} == {5: "RCC", 37: "USART1"}
+
+
+def test_the_index_is_cached_and_reused(svd_root):
+    cache = svd_root / "cache"
+    database = svd.SvdDatabase(svd_root, cache_directory=cache)
+    first = database.load()
+    assert list(cache.glob("svd-index-*.json"))
+    second = svd.SvdDatabase(svd_root, cache_directory=cache).load()
+    assert [item.name for item in first] == [item.name for item in second]
+
+
+def test_registers_are_parsed_only_for_the_peripherals_asked_about(svd_root):
+    path = str(svd_root / "Acme" / "ACME32F407.svd")
+    everything = svd.parse_registers(path)
+    narrowed = svd.parse_registers(path, bases=[0x40011000])
+    assert len(narrowed) == 4
+    assert len(everything) > len(narrowed)
+    assert {item.address for item in narrowed} == {
+        0x40011000,
+        0x40011004,
+        0x40011008,
+        0x4001100C,
+    }
+    assert all(item.peripheral == "USART1" for item in narrowed)
+
+
+def test_register_access_flags_are_read():
+    from raw2elf.analysis.svd import Register
+
+    assert Register("P", "R", 0, 32, "read-only").readable
+    assert not Register("P", "R", 0, 32, "read-only").writable
+    assert Register("P", "R", 0, 32, "write-only").writable
+    assert Register("P", "R", 0, 32, "").readable and Register("P", "R", 0, 32, "").writable
+
+
+def test_an_unparseable_file_is_skipped_not_fatal(tmp_path):
+    broken = tmp_path / "broken.svd"
+    broken.write_text("<device><name>OOPS</name>")  # truncated, no peripherals
+    assert svd.parse_index_entry(broken, "Vendor") is None
+    assert svd.parse_registers(str(broken)) == []
+
+
+# -- matching --------------------------------------------------------------
+
+
+def test_the_right_device_family_outranks_an_unrelated_part(svd_root):
+    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
+    ranked = svd.rank_devices(devices, ACCESSES)
+    assert ranked
+    assert ranked[0].base_score == 1.0
+    assert ranked[0].register_hits == len({item.value for item in ACCESSES})
+    assert "OTHER100" not in [item.device.name for item in ranked]
+
+
+def test_recovered_peripheral_bases_survive_a_folded_displacement():
+    # "ldr r3, =0x40023000; str r2, [r3, #0x800]" is an access to the
+    # peripheral at 0x40023800, not to one at 0x40023000.
+    assert 0x40023800 in svd.implied_bases(ACCESSES)
+    assert 0x40023000 not in svd.implied_bases(ACCESSES)
+    assert 0x40020000 in svd.implied_bases(ACCESSES)
+
+
+def test_indistinguishable_devices_are_reported_as_a_family(svd_root):
+    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
+    ranked = svd.rank_devices(devices, ACCESSES)
+    tied = [item for item in ranked if ranked[0].score - item.score <= svd.TIE_MARGIN]
+    assert len(tied) == 3
+    label, representative = svd.describe_tie(tied)
+    # The two Acme parts share a prefix; the clone from another vendor is
+    # acknowledged rather than hidden or presented as the answer.
+    assert label.startswith("ACME32F4")
+    assert "register-compatible" in label
+    assert "CLN32F4" in label
+    assert representative.device.vendor == "Acme"
+
+
+def test_a_single_clear_winner_is_named_exactly(svd_root):
+    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
+    only = [item for item in devices if item.name == "ACME32F407"]
+    ranked = svd.rank_devices(only, ACCESSES)
+    label, _representative = svd.describe_tie(ranked[:1])
+    assert label == "ACME32F407 family"
+
+
+def test_a_common_family_is_the_shared_prefix():
+    assert svd.common_family(["STM32F405", "STM32F407", "STM32F415"]) == "STM32F4"
+    assert svd.common_family(["STM32F407"]) == "STM32F407"
+    assert svd.common_family(["STM32F4", "nRF52840"]) == ""
+
+
+def test_writing_a_read_only_register_is_a_contradiction(tmp_path):
+    root = tmp_path / "svd"
+    write_device(
+        root / "Vendor",
+        "STRICT",
+        [
+            {
+                "name": "RCC",
+                "base": 0x40023800,
+                "access": "read-only",
+                "registers": [("CR", 0x00), ("CFGR", 0x08)],
+            }
+        ],
+    )
+    devices = svd.SvdDatabase(root, cache_directory=root / "cache").load()
+    writes = [_access(0x40023800, 0x40023000, 0x800), _access(0x40023808, 0x40023000, 0x808)]
+    ranked = svd.rank_devices(devices, writes)
+    assert ranked[0].contradictions == 2
+    assert ranked[0].register_score < 1.0
+
+
+def test_ranking_with_no_accesses_returns_nothing(svd_root):
+    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
+    assert svd.rank_devices(devices, []) == []
+
+
+# -- the pass --------------------------------------------------------------
+
+
+def test_a_missing_svd_database_does_not_stop_reconstruction(standard, monkeypatch, tmp_path):
+    monkeypatch.setenv("RAW2ELF_SVD_DIR", str(tmp_path / "does-not-exist"))
+    monkeypatch.setattr(svd, "find_svd_root", lambda explicit=None: None)
+    reconstruction = reconstruct_bytes(standard.image, enable_svd=True)
+    assert reconstruction.elf
+    assert reconstruction.context.get("mcu") is None
+    assert any("no CMSIS-SVD data" in warning for warning in reconstruction.context.warnings)
+
+
+def test_svd_matching_names_interrupt_handlers(standard, svd_root):
+    reconstruction = reconstruct_bytes(
+        standard.image, enable_svd=True, svd=str(svd_root), svd_symbols="peripherals"
+    )
+    names = reconstruction.context.get("handler_names") or {}
+    # The fixture's vector table puts real handlers at device IRQ 28 and 37.
+    assert names.get(16 + 37) == "USART1_IRQHandler"
+    annotations = reconstruction.context.get("svd_annotations")
+    assert {item["name"] for item in annotations["peripherals"]} >= {"RCC", "GPIOA", "USART1"}
+
+
+def test_peripheral_symbols_reach_the_elf(standard, svd_root):
+    reconstruction = reconstruct_bytes(
+        standard.image, enable_svd=True, svd=str(svd_root), svd_symbols="peripherals"
+    )
+    symbols = {item.name: item.value for item in reconstruction.context.get("symbols")}
+    assert symbols["RCC_BASE"] == 0x40023800
+    assert symbols["USART1_BASE"] == 0x40011000
+    assert "RCC_CFGR" not in symbols  # register level was not requested
+
+
+def test_register_symbols_are_available_on_request(standard, svd_root):
+    reconstruction = reconstruct_bytes(
+        standard.image, enable_svd=True, svd=str(svd_root), svd_symbols="registers"
+    )
+    symbols = {item.name: item.value for item in reconstruction.context.get("symbols")}
+    assert symbols["RCC_CFGR"] == 0x40023808
+    assert symbols["GPIOA_AFRL"] == 0x40020020
+
+
+def test_svd_symbols_can_be_turned_off_entirely(standard, svd_root):
+    reconstruction = reconstruct_bytes(
+        standard.image, enable_svd=True, svd=str(svd_root), svd_symbols="none"
+    )
+    symbols = {item.name for item in reconstruction.context.get("symbols")}
+    assert not any(name.endswith("_BASE") for name in symbols)
+
+
+def test_an_analyst_supplied_mcu_wins(standard, svd_root):
+    reconstruction = reconstruct_bytes(
+        standard.image, enable_svd=True, svd=str(svd_root), mcu="ACME32F405"
+    )
+    mcu = reconstruction.context.get("mcu")
+    assert mcu["label"] == "ACME32F405"
+    assert mcu["exact"] is True
+    assert mcu["match"].confidence == 1.0
+
+
+def test_an_unknown_mcu_name_is_reported_rather_than_ignored(standard, svd_root):
+    reconstruction = reconstruct_bytes(
+        standard.image, enable_svd=True, svd=str(svd_root), mcu="NOSUCHPART"
+    )
+    assert reconstruction.context.get("mcu") is None
+    assert any("NOSUCHPART" in warning for warning in reconstruction.context.warnings)

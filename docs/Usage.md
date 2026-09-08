@@ -1,0 +1,299 @@
+# Usage
+
+## Installing
+
+```bash
+pip install capstone
+```
+
+Python 3.10 or newer, and that is the only dependency. MCU identification
+additionally wants a CMSIS-SVD tree; without one everything else still works.
+See [Recovery.md](Recovery.md#mcu-identification).
+
+## Invoking it
+
+From a clone of this repository:
+
+```bash
+python -m raw2elf firmware.bin -o firmware.elf
+```
+
+From anywhere, with the directory that contains the `raw2elf` package on
+`PYTHONPATH`, or directly by path — `cli.py` puts its own package directory on
+`sys.path`, so it needs no environment at all:
+
+```bash
+python path/to/raw2elf/cli.py firmware.bin -o firmware.elf
+```
+
+All three forms are equivalent. The examples below write `raw2elf` for brevity.
+
+Without `-o` the ELF goes next to the input with an `.elf` suffix, and the
+manifest alongside it as `<name>.raw2elf.json`. `--report PATH` chooses the
+manifest path; `--no-report` skips it.
+
+## A worked example
+
+This is a 2 MiB flash dump holding a bootloader and an application, with no
+load address, no entry point, a large constant table and 1.5 MiB of erased
+flash:
+
+```
+$ raw2elf mystery.bin -o mystery.elf
+Input format:       Raw binary
+  detected as:      2097152 bytes
+Input size:         2.0M in 1 segment(s)
+Architecture:       ARM Cortex-M
+Entry structure:    vector_table at file offset 0x000000
+Vector table:       0x08000000
+Initial MSP:        0x20020000
+Load base:          0x08000000
+Entry point:        0x08000318  (ELF e_entry 0x08000319)
+
+Recovered:
+  Code references:   184
+  Flash references:  11
+  RAM references:    13 accessed, 1076 as address literals
+  MMIO accesses:     54
+
+Memory regions:
+  flash  0x08000000-0x0807ffff     512K  flash
+  ram    0x20000000-0x200003ff     1.0K  ram
+  ram    0x2001fc00-0x2001ffff     1.0K  ram1
+  mmio   0x40000000-0x40023bff     143K  mmio0
+  mmio   0xe0000000-0xe00fffff     1.0M  ppb
+
+Startup initialization:
+  .data  0x080003d4 -> 0x20000000  8B
+  .bss   0x20000008-0x20000128  288B
+
+Likely MCU:
+  AT32F4 / STM32F4 -- register-compatible, indistinguishable here  (confidence 0.99)
+
+Confidence:
+  Architecture: HIGH    (0.95)
+  Base:         HIGH    (0.99)
+  Entry:        HIGH    (1.00)
+
+Generated:
+  mystery.elf
+  mystery.raw2elf.json
+```
+
+Four details in that output are deliberate, and they say most of what there is
+to know about how the tool behaves.
+
+**The Flash region is 512K, not 2M.** The erased tail is reported as padding
+and left out of the ELF, so the output is not inflated by 1.5 MiB of `0xff`.
+`--keep-padding` puts it back.
+
+**RAM references are split by how strong the evidence is.** Thirteen came from
+load and store instructions whose effective address was recovered. The other
+thousand are literals that merely look like RAM addresses, most of them from
+the constant table. Reporting one total for both would make the weak evidence
+look like the strong kind, and the recovered RAM regions are built only from
+the strong kind.
+
+**The entry point is reported twice.** `0x08000318` is the address; the ELF
+records `0x08000319` because Cortex-M code pointers carry the Thumb bit. Both
+are in the manifest, as `entry` and `elf_entry`.
+
+**The MCU is two families, not a part number.** AT32F4 and STM32F4 are
+register-compatible, so from these accesses the part genuinely cannot be
+narrowed further, and saying otherwise would be false precision.
+
+## Input formats
+
+Detection tries explicit parsers before falling back to a raw binary, and each
+one validates its own framing.
+
+| Format | Notes |
+| --- | --- |
+| Raw binary | The fallback. Load address unknown until analysis. |
+| Intel HEX | Records and checksums verified; extended-address and entry records honoured. |
+| Motorola S-Record | `S1`/`S2`/`S3` data with checksums; termination records give an entry hint. |
+| `xxd` | Default, `-g1`/`-g4`, non-default column counts, `-a` repeat squeezing. |
+| `hexdump -C` | Including `*` repeat markers and the trailing length line. |
+| Bare hex | `xxd -p` output, comma/colon-separated bytes, C array initializers. |
+
+`--detect` reports what each parser thought, without analysing anything:
+
+```
+$ raw2elf firmware.hex --detect
+Selected: ihex (Intel HEX)
+Normalized: 988 bytes in 1 segment(s)
+
+Parser opinions:
+  ihex         0.98  32 valid records
+  plainhex     0.00  input is framed like Intel HEX or S-Records, not a bare hex stream
+  raw          0.01  2601 bytes
+```
+
+Three properties of ingestion are worth stating explicitly, because they are
+where naive handling of these formats goes wrong.
+
+**Nothing is repaired.** A record file whose checksums fail is reported as
+broken, not salvaged. In particular the bare-hex parser refuses input that is
+*framed* like Intel HEX or S-Records, so a corrupt record file can never be
+rescued into plausible-looking firmware by dropping its framing and keeping
+the hex digits.
+
+**The ASCII column is parsed, not stripped.** Deleting "non-hex" characters
+from a terminal dump is a reliable way to produce corrupted firmware, because
+the ASCII column is full of characters that look like hex digits. Each line's
+declared offset is then used as a checksum: it must equal the previous offset
+plus the previous line's byte count. That is also how erased regions and `*`
+repeat markers are reconstructed exactly.
+
+**Default `hexdump` output is refused.** Its 16-bit groups are byte-swapped on
+a little-endian host, so decoding it would silently produce wrong firmware:
+
+```
+$ raw2elf dump.txt
+raw2elf: this is default 'hexdump' output; its 16-bit groups are byte-swapped,
+so decoding it would silently produce wrong firmware. Re-dump with
+'hexdump -C' or 'xxd'
+```
+
+`--input-format raw` overrides any of this when you know better.
+
+Intel HEX and S-Records keep their declared addresses, so they need no base
+recovery. Discontiguous inputs stay discontiguous: separate ELF segments, not
+one segment with an enormous zero-filled hole.
+
+An ELF handed in by mistake is recognized and refused with advice, rather than
+analysed as though its headers were firmware.
+
+## Options
+
+Analyst input always wins over inference.
+
+```bash
+raw2elf firmware.bin \
+    --arch arm-cortex-m \
+    --base 0x08000000 \
+    --entry 0x08001450 \
+    --vector-offset 0 \
+    -o firmware.elf
+```
+
+### Recovery overrides
+
+| Option | Effect |
+| --- | --- |
+| `--arch NAME` | Force an architecture backend instead of probing. `auto` by default. |
+| `--base ADDR` | Runtime load address of the image. |
+| `--entry ADDR` | Entry point. |
+| `--vector-offset OFFSET` | File offset of the entry/vector structure. |
+| `--image N` | Which candidate image to reconstruct. See [Recovery.md](Recovery.md#dumps-with-several-images). |
+| `--input-format NAME` | Force a parser instead of detecting one. |
+
+### MCU identification
+
+| Option | Effect |
+| --- | --- |
+| `--mcu NAME` | Assume this part instead of ranking candidates. |
+| `--svd PATH` | An SVD file, or a directory to search. |
+| `--no-svd` | Skip MCU identification entirely. |
+| `--svd-symbols LEVEL` | `none`, `peripherals` (default), or `registers`. |
+
+### Confidence policy
+
+| Option | Effect |
+| --- | --- |
+| `--minimum-confidence F` | Refuse to emit below this confidence. `0.5` by default. |
+| `--fail-on-ambiguity` | Refuse when the runner-up is too close to the winner. |
+
+### Output
+
+| Option | Effect |
+| --- | --- |
+| `--split-sections` | Emit `.text`/`.rodata` where the evidence allows it. |
+| `--keep-padding` | Keep large trailing erased-flash regions in the ELF. |
+| `--max-instructions N` | Cap on instructions decoded. `400000` by default. |
+| `--padding-threshold N` | Shortest run of a repeated byte reported as padding. `256` by default. |
+
+### Queries
+
+Each of these prints and exits without writing anything.
+
+| Option | Effect |
+| --- | --- |
+| `--list-images` | List the candidate firmware images in the input. |
+| `--list-arch` | List the available architecture backends. |
+| `--detect` | Report input-format detection and each parser's opinion. |
+| `--probe` | Report architecture probe scores and their evidence. |
+
+### Diagnostics
+
+`-v` prints the evidence behind the decisions, which is the first thing to
+reach for when a result looks wrong:
+
+```
+Recovered base: 0x08000000
+Confidence: HIGH (0.99)
+
+Evidence:
+  + word 0 0x20020000 is a plausible initial MSP, eight-byte aligned as AAPCS wants
+  + 88 vectors share handler 0x080001b0, the signature of a shared default handler
+  + vector table lands at 0x08000000, aligned to 0x8000000
+  + reset vector 0x08000319 maps to executable bytes (94 instructions over 196
+    unbroken bytes, 15 distinct mnemonics, 45% single-mnemonic)
+  + all handlers lie within 0x318 bytes after their own vector table at 0x08000000
+  + loop at 0x08000320 walks r3 from 0x20000000 to 0x20000008 in 32-bit stores
+  + its load walks r2 from 0x080003d4, and all 8 bytes of that range are present
+```
+
+Repeating `-v` adds per-pass timing. Everything shown here, and more, is in the
+[manifest](Manifest.md) regardless of verbosity.
+
+## When it refuses
+
+`raw2elf` does not emit a confidently wrong ELF. If the best candidate misses
+`--minimum-confidence`, or `--fail-on-ambiguity` is set and the runner-up is
+too close, it reports the candidates and exits non-zero:
+
+```
+$ raw2elf odd.bin -o odd.elf
+raw2elf: best runtime base address candidate 0x07f00000 has confidence 0.31,
+below the required 0.50
+
+raw2elf will not emit an ELF it cannot justify. Supply the answer explicitly
+(--arch / --base / --entry / --vector-offset / --image), or lower
+--minimum-confidence to accept the best candidate.
+```
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | An ELF was written. |
+| `2` | Usage error, missing file, or input that could not be read. |
+| `3` | Refused: the recovered configuration did not meet the required confidence. |
+
+Together with `--minimum-confidence` and `--fail-on-ambiguity` that makes batch
+processing deterministic. A run either produces an ELF that met the bar, or
+fails loudly.
+
+## Programmatic use
+
+The CLI is a thin layer over two calls:
+
+```python
+from raw2elf import input as ingest
+from raw2elf.core.options import Options
+from raw2elf.reconstruct import reconstruct
+from raw2elf.report import manifest
+
+image = ingest.load("firmware.bin")
+result = reconstruct(image, Options(minimum_confidence=0.8))
+
+open("firmware.elf", "wb").write(result.elf)
+open("firmware.raw2elf.json", "w").write(manifest.dumps(result))
+
+print(hex(result.runtime_base), hex(result.entry))
+```
+
+`reconstruct` raises `LowConfidenceError` or `AmbiguityError` from
+`raw2elf.core.hypothesis` where the CLI would exit `3`, and `OptionError` from
+`raw2elf.core.options` for an option that cannot be honoured. Everything the
+run produced is on `result.context`; the artifact names are listed in
+[Manifest.md](Manifest.md) and [Architecture.md](Architecture.md).
