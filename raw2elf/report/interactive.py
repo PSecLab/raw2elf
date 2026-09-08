@@ -36,13 +36,26 @@ class TerminalSession(Interaction):
         self,
         stream: Optional[TextIO] = None,
         prompt_input=input,
+        chip_prompt: bool = True,
     ) -> None:
         self.stream = stream if stream is not None else sys.stderr
         self._input = prompt_input
         #: Flags reproducing this session's answers, in the order given.
         self.chosen_flags: list[str] = []
+        #: Offer to take a part number where one would help.
+        self.chip_prompt = chip_prompt
+        #: What the analyst said was printed on the chip, if anything.
+        self.chip: Optional[str] = None
 
     # -- Interaction ------------------------------------------------------
+
+    def ask_text(self, question: str, hint: str = "") -> Optional[str]:
+        self._say("")
+        self._say(question)
+        if hint:
+            self._say(f"  {hint}")
+        answer = self._read("> ")
+        return answer or None
 
     def accepted(self, subject: str, label: str, confidence: Optional[float] = None) -> None:
         suffix = f"  ({confidence:.2f})" if confidence is not None else ""
@@ -77,6 +90,11 @@ class TerminalSession(Interaction):
         if hidden:
             self._say(f"  ... {hidden} further candidate(s) scored lower and are not shown")
         self._say("  e) enter a value")
+        if self.chip_prompt and subject == "runtime base address":
+            # The question an analyst can actually answer. Where the firmware
+            # is loaded is a deduction; what the package says is an
+            # observation, and it implies the answer.
+            self._say("  c) name the chip instead, if you can read it off the board")
         self._say("  q) abort")
 
         while True:
@@ -86,6 +104,11 @@ class TerminalSession(Interaction):
                 return None
             if answer == "":
                 answer = "1"
+            if answer.lower() == "c" and self.chip_prompt and subject == "runtime base address":
+                picked = self._from_chip(choices)
+                if picked is not None:
+                    return self._record(picked)
+                continue
             if answer.lower() in ("e", "enter"):
                 picked = self._read_custom(subject, choices)
                 if picked is not None:
@@ -96,6 +119,35 @@ class TerminalSession(Interaction):
             self._say(f"  not one of 1..{len(shown)}, e or q")
 
     # -- helpers ----------------------------------------------------------
+
+    def _from_chip(self, choices: list[Choice]) -> Optional[Choice]:
+        """Turn a part number into a load address, if the family is known."""
+        from ..analysis.devices import layout_for
+
+        answer = self.ask_text(
+            "What is printed on the chip?",
+            "for example STM32F407VGT6, nRF52840 or LPC1768; Enter to go back",
+        )
+        if not answer:
+            return None
+        layout = layout_for(answer)
+        if layout is None or not layout.flash:
+            self._say(f"  no memory layout is known for {answer}")
+            return None
+
+        self.chip = answer
+        self._say(f"  {layout.describe()}")
+        wanted = layout.flash[0]
+        for choice in choices:
+            if choice.value == wanted:
+                self._say("  which is one of the candidates above")
+                return choice
+        return Choice(
+            value=wanted,
+            label=f"0x{wanted:08x}",
+            origin=f"{layout.family} Flash origin",
+            flag=f"--mcu {answer}",
+        )
 
     def _read_custom(self, subject: str, choices: list[Choice]) -> Optional[Choice]:
         """Take a value the analysis never proposed."""

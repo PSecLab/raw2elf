@@ -2,13 +2,24 @@
 
 from __future__ import annotations
 
+import pathlib
 from pathlib import Path
 
 import pytest
 
 from conftest import reconstruct_bytes
 from raw2elf.analysis import svd
+from raw2elf.analysis.svdsource import DirectorySource
 from raw2elf.core.reference import Access, AddressClass, Reference, ReferenceKind
+
+
+def database(root, cache=None):
+    """An index over a directory of SVD files."""
+    return svd.SvdDatabase(DirectorySource(root), cache_directory=cache or root / "cache")
+
+
+def text_of(path):
+    return pathlib.Path(path).read_text()
 
 DEVICE_TEMPLATE = """\
 <?xml version="1.0" encoding="utf-8"?>
@@ -173,7 +184,7 @@ ACCESSES = [
 
 
 def test_indexing_extracts_peripherals_interrupts_and_the_core(svd_root):
-    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
+    devices = database(svd_root).load()
     by_name = {item.name: item for item in devices}
     assert set(by_name) == {"ACME32F407", "ACME32F405", "CLN32F4", "OTHER100"}
 
@@ -188,17 +199,16 @@ def test_indexing_extracts_peripherals_interrupts_and_the_core(svd_root):
 
 def test_the_index_is_cached_and_reused(svd_root):
     cache = svd_root / "cache"
-    database = svd.SvdDatabase(svd_root, cache_directory=cache)
-    first = database.load()
+    first = database(svd_root, cache).load()
     assert list(cache.glob("svd-index-*.json"))
-    second = svd.SvdDatabase(svd_root, cache_directory=cache).load()
+    second = database(svd_root, cache).load()
     assert [item.name for item in first] == [item.name for item in second]
 
 
 def test_registers_are_parsed_only_for_the_peripherals_asked_about(svd_root):
-    path = str(svd_root / "Acme" / "ACME32F407.svd")
-    everything = svd.parse_registers(path)
-    narrowed = svd.parse_registers(path, bases=[0x40011000])
+    body = text_of(svd_root / "Acme" / "ACME32F407.svd")
+    everything = svd.parse_registers(body)
+    narrowed = svd.parse_registers(body, bases=[0x40011000])
     assert len(narrowed) == 4
     assert len(everything) > len(narrowed)
     assert {item.address for item in narrowed} == {
@@ -220,18 +230,17 @@ def test_register_access_flags_are_read():
 
 
 def test_an_unparseable_file_is_skipped_not_fatal(tmp_path):
-    broken = tmp_path / "broken.svd"
-    broken.write_text("<device><name>OOPS</name>")  # truncated, no peripherals
-    assert svd.parse_index_entry(broken, "Vendor") is None
-    assert svd.parse_registers(str(broken)) == []
+    broken = "<device><name>OOPS</name>"  # truncated, no peripherals
+    assert svd.parse_index_entry(broken, "Vendor", "broken") is None
+    assert svd.parse_registers(broken) == []
 
 
 # -- matching --------------------------------------------------------------
 
 
 def test_the_right_device_family_outranks_an_unrelated_part(svd_root):
-    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
-    ranked = svd.rank_devices(devices, ACCESSES)
+    index = database(svd_root)
+    ranked = svd.rank_devices(index.load(), ACCESSES, database=index)
     assert ranked
     assert ranked[0].base_score == 1.0
     assert ranked[0].register_hits == len({item.value for item in ACCESSES})
@@ -247,8 +256,8 @@ def test_recovered_peripheral_bases_survive_a_folded_displacement():
 
 
 def test_indistinguishable_devices_are_reported_as_a_family(svd_root):
-    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
-    ranked = svd.rank_devices(devices, ACCESSES)
+    index = database(svd_root)
+    ranked = svd.rank_devices(index.load(), ACCESSES, database=index)
     tied = [item for item in ranked if ranked[0].score - item.score <= svd.TIE_MARGIN]
     assert len(tied) == 3
     label, representative = svd.describe_tie(tied)
@@ -261,9 +270,9 @@ def test_indistinguishable_devices_are_reported_as_a_family(svd_root):
 
 
 def test_a_single_clear_winner_is_named_exactly(svd_root):
-    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
-    only = [item for item in devices if item.name == "ACME32F407"]
-    ranked = svd.rank_devices(only, ACCESSES)
+    index = database(svd_root)
+    only = [item for item in index.load() if item.name == "ACME32F407"]
+    ranked = svd.rank_devices(only, ACCESSES, database=index)
     label, _representative = svd.describe_tie(ranked[:1])
     assert label == "ACME32F407 family"
 
@@ -288,16 +297,15 @@ def test_writing_a_read_only_register_is_a_contradiction(tmp_path):
             }
         ],
     )
-    devices = svd.SvdDatabase(root, cache_directory=root / "cache").load()
+    index = database(root)
     writes = [_access(0x40023800, 0x40023000, 0x800), _access(0x40023808, 0x40023000, 0x808)]
-    ranked = svd.rank_devices(devices, writes)
+    ranked = svd.rank_devices(index.load(), writes, database=index)
     assert ranked[0].contradictions == 2
     assert ranked[0].register_score < 1.0
 
 
 def test_ranking_with_no_accesses_returns_nothing(svd_root):
-    devices = svd.SvdDatabase(svd_root, cache_directory=svd_root / "cache").load()
-    assert svd.rank_devices(devices, []) == []
+    assert svd.rank_devices(database(svd_root).load(), []) == []
 
 
 # -- the pass --------------------------------------------------------------
@@ -305,7 +313,7 @@ def test_ranking_with_no_accesses_returns_nothing(svd_root):
 
 def test_a_missing_svd_database_does_not_stop_reconstruction(standard, monkeypatch, tmp_path):
     monkeypatch.setenv("RAW2ELF_SVD_DIR", str(tmp_path / "does-not-exist"))
-    monkeypatch.setattr(svd, "find_svd_root", lambda explicit=None: None)
+    monkeypatch.setattr(svd, "open_source", lambda *args, **kwargs: None)
     reconstruction = reconstruct_bytes(standard.image, enable_svd=True)
     assert reconstruction.elf
     assert reconstruction.context.get("mcu") is None
@@ -366,3 +374,84 @@ def test_an_unknown_mcu_name_is_reported_rather_than_ignored(standard, svd_root)
     )
     assert reconstruction.context.get("mcu") is None
     assert any("NOSUCHPART" in warning for warning in reconstruction.context.warnings)
+
+
+# -- what a part number tells you ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("part", "family", "flash"),
+    [
+        ("STM32F407VGT6", "STM32", 0x08000000),
+        ("stm32f103c8t6", "STM32", 0x08000000),
+        ("nRF52840-QIAA", "nRF52", 0x00000000),
+        ("LPC1768FBD100", "LPC17xx", 0x00000000),
+        ("ATSAM4S8B", "SAM4", 0x00400000),
+        ("RP2040", "RP2040", 0x10000000),
+        ("MKL25Z128VLK4", "Kinetis L", 0x00000000),
+        ("CY8C6247BZI", "PSoC 6", 0x10000000),
+    ],
+)
+def test_a_part_number_gives_a_memory_layout(part, family, flash):
+    from raw2elf.analysis.devices import layout_for
+
+    layout = layout_for(part)
+    assert layout is not None, part
+    assert layout.family == family
+    assert layout.flash[0] == flash
+
+
+def test_a_longer_prefix_wins_over_a_shorter_one():
+    """MKL is Kinetis L, not Kinetis K, despite both starting MK."""
+    from raw2elf.analysis.devices import layout_for
+
+    assert layout_for("MKL25Z128").family == "Kinetis L"
+    assert layout_for("MK64FN1M0").family == "Kinetis K"
+
+
+def test_an_unknown_part_has_no_layout_rather_than_a_guessed_one():
+    from raw2elf.analysis.devices import layout_for
+
+    assert layout_for("SOME-CUSTOM-ASIC") is None
+    assert layout_for("") is None
+    assert layout_for(None) is None
+
+
+def test_package_suffixes_do_not_prevent_a_match():
+    from raw2elf.analysis.devices import normalise
+
+    assert normalise("STM32F407VGT6") == "STM32F407VGT6"
+    assert normalise("stm32-f407 vg") == "STM32F407VG"
+
+
+def test_a_full_order_code_finds_the_right_svd_device(svd_root):
+    from raw2elf.analysis.devices import search
+
+    devices = database(svd_root).load()
+    found = search("ACME32F407ABC-XYZ", devices)
+    assert found and found[0].name == "ACME32F407"
+
+
+def test_searching_for_something_unrelated_finds_nothing(svd_root):
+    from raw2elf.analysis.devices import search
+
+    assert search("ZZ9", database(svd_root).load()) == []
+
+
+def test_every_layout_entry_is_well_formed():
+    """The table is data, so it is checked as data."""
+    import json
+
+    from raw2elf.analysis.devices import LAYOUTS
+
+    payload = json.loads(LAYOUTS.read_text())
+    prefixes = set()
+    for entry in payload["families"]:
+        assert entry["prefix"] and entry["family"]
+        assert entry["prefix"] not in prefixes, f"duplicate prefix {entry['prefix']}"
+        prefixes.add(entry["prefix"])
+        assert entry["flash"], f"{entry['prefix']} names no Flash origin"
+        for group in ("flash", "ram"):
+            for address in entry[group]:
+                assert address.startswith("0x")
+                assert int(address, 16) < (1 << 32)

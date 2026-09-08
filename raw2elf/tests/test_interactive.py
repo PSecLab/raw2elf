@@ -231,7 +231,8 @@ def test_the_cli_prints_the_command_that_repeats_the_session(tmp_path, capsys, m
     from raw2elf import cli
 
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr(interactive, "TerminalSession", lambda: Scripted(["2"]))
+    # "" skips the chip question, "2" answers the base question.
+    monkeypatch.setattr(interactive, "TerminalSession", lambda: Scripted(["", "2"]))
 
     path = tmp_path / "noise.bin"
     path.write_bytes(NOISE)
@@ -269,3 +270,72 @@ def test_choices_carry_their_reasoning():
 
 def test_choosing_from_nothing_declines():
     assert Scripted([]).choose("runtime base address", []) is None
+
+
+# -- the question an analyst can actually answer ---------------------------
+#
+# Where a firmware is loaded is a deduction. What is printed on the package is
+# an observation, and for most families it implies the answer, so that is what
+# a session asks for.
+
+
+def test_a_part_number_settles_the_load_address(standard):
+    """Naming the chip resolves what picking an address otherwise would."""
+    from raw2elf.analysis.devices import layout_for
+
+    layout = layout_for("STM32F407VGT6")
+    assert layout is not None and layout.flash[0] == standard.base
+
+    session = Scripted(["c", "STM32F407VGT6"])
+    result = reconstruct(
+        ingest.parse(NOISE), _options(session, arch="arm-cortex-m", minimum_confidence=0.5)
+    )
+    assert result.runtime_base == standard.base
+    assert "STM32 family maps Flash" in session.output
+    assert session.chosen_flags == ["--mcu STM32F407VGT6"]
+
+
+def test_an_unknown_part_number_is_admitted_to_rather_than_guessed_at():
+    session = Scripted(["c", "SOME-CUSTOM-ASIC", "1"])
+    reconstruct(ingest.parse(NOISE), _options(session, arch="arm-cortex-m", minimum_confidence=0.5))
+    assert "no memory layout is known for SOME-CUSTOM-ASIC" in session.output
+
+
+def test_a_supplied_part_number_is_evidence_not_an_instruction(standard):
+    """It must not override an image whose own evidence says otherwise."""
+    # This image is genuinely linked at 0x10000000, and saying "STM32" must
+    # not drag it to 0x08000000.
+    result = reconstruct_bytes(
+        pytest.importorskip("raw2elf.eval.corpus") and _nonstandard(), mcu="STM32F407VGT6"
+    )
+    assert result.context.get("runtime_base") == 0x10000000
+
+
+def _nonstandard():
+    from conftest import FIRMWARES
+    from raw2elf.eval import corpus
+
+    return corpus.ground_truth(FIRMWARES["nonstandard_base"]).image
+
+
+def test_a_part_number_is_recorded_for_the_repeat_command(standard):
+    session = Scripted(["STM32F407VGT6"])
+    from raw2elf import cli
+    from raw2elf.core.options import Options
+
+    options = Options(enable_svd=False)
+    cli._ask_about_the_chip(session, options)
+    assert options.mcu == "STM32F407VGT6"
+    assert session.chosen_flags == ["--mcu STM32F407VGT6"]
+    assert "STM32 family maps Flash" in session.output
+
+
+def test_skipping_the_chip_question_changes_nothing():
+    from raw2elf import cli
+    from raw2elf.core.options import Options
+
+    session = Scripted([""])
+    options = Options(enable_svd=False)
+    cli._ask_about_the_chip(session, options)
+    assert options.mcu is None
+    assert session.chosen_flags == []

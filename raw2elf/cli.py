@@ -74,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-svd", action="store_true", help="skip MCU identification entirely"
     )
     peripherals.add_argument(
+        "--no-svd-fetch",
+        action="store_true",
+        help="do not download the CMSIS-SVD database when no local copy is found",
+    )
+    peripherals.add_argument(
         "--svd-symbols",
         choices=("none", "peripherals", "registers"),
         default="peripherals",
@@ -155,6 +160,7 @@ def options_from(arguments: argparse.Namespace) -> Options:
         mcu=arguments.mcu,
         svd=arguments.svd,
         enable_svd=not arguments.no_svd,
+        fetch_svd=not arguments.no_svd_fetch,
         svd_symbols=arguments.svd_symbols,
         minimum_confidence=arguments.minimum_confidence,
         fail_on_ambiguity=arguments.fail_on_ambiguity,
@@ -166,6 +172,30 @@ def options_from(arguments: argparse.Namespace) -> Options:
     )
     options.extra["trim_padding"] = not arguments.keep_padding
     return options
+
+
+def _ask_about_the_chip(session, options: Options) -> None:
+    """Take the one clue the image cannot contain.
+
+    Where a firmware is loaded is a deduction; what the package says is an
+    observation, and for most families it implies the answer. Asking costs
+    one question and often removes the need for any of the harder ones.
+    """
+    from .analysis.devices import layout_for
+
+    answer = session.ask_text(
+        "What is printed on the chip? (Enter to skip; raw2elf will work it out)",
+        "for example STM32F407VGT6, nRF52840 or LPC1768",
+    )
+    if not answer:
+        return
+    options.mcu = answer
+    session.chosen_flags.append(f"--mcu {answer}")
+    layout = layout_for(answer)
+    if layout is None:
+        session.note(f"  no memory layout is known for {answer}; using it for peripherals only")
+    else:
+        session.note(f"  {layout.describe()}")
 
 
 def _reproduce(arguments: argparse.Namespace, session) -> str:
@@ -235,6 +265,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return EXIT_USAGE
         session = interactive.TerminalSession()
         options.interaction = session
+        if not options.mcu:
+            _ask_about_the_chip(session, options)
 
     try:
         reconstruction = reconstruct(image, options)

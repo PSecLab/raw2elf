@@ -30,6 +30,7 @@ from ..core.interaction import Choice
 from ..core.pipeline import AnalysisContext, AnalysisPass
 from ..core.reference import ReferenceSet
 from ..core.util import align_down, logistic
+from .devices import layout_for
 
 #: How many pre-ranked candidates get the backend's expensive verification.
 VERIFY_LIMIT = 24
@@ -37,6 +38,10 @@ VERIFY_LIMIT = 24
 SYNTHESIS_LIMIT = 4000
 #: Softmax temperature used to turn scores into candidate confidences.
 TEMPERATURE = 1.5
+#: How much a supplied part number's Flash origin counts for. Comparable to a
+#: reset vector decoding as code, so it can settle a close call without
+#: overruling an image that clearly says otherwise.
+DEVICE_LAYOUT_WEIGHT = 4.0
 
 
 class BaseRecovery(AnalysisPass):
@@ -153,6 +158,7 @@ class BaseRecovery(AnalysisPass):
 
     def _infer(self, context: AnalysisContext) -> list[BaseCandidate]:
         backend = context.backend
+        options = context.options
         image = context.image
         references: ReferenceSet = context.get("references") or ReferenceSet()
         constraints = backend.generate_base_constraints(context)
@@ -177,6 +183,29 @@ class BaseRecovery(AnalysisPass):
                 "no candidate load addresses could be synthesized; supply one with --base"
             )
             return []
+
+        # A part number the analyst supplied is the one piece of evidence the
+        # image cannot contain. It is scored, not obeyed: a firmware linked
+        # somewhere unusual still wins on its own evidence.
+        layout = layout_for(options.mcu) if options.mcu else None
+        if layout is not None:
+            for address in layout.flash:
+                if constraints.permits(address):
+                    proposals.setdefault(address, f"{layout.family} Flash origin")
+            context.note(
+                Evidence(
+                    kind="device_layout",
+                    source=self.name,
+                    explanation=f"{options.mcu} was supplied, and {layout.describe()}",
+                    value=layout.flash[0] if layout.flash else None,
+                )
+            )
+        elif options.mcu:
+            context.log(
+                f"no memory layout is known for {options.mcu}; it will still be used "
+                "for peripheral matching",
+                level=1,
+            )
 
         seed_weights = {seed.runtime_base: seed.weight for seed in constraints.seeds}
         seed_evidence = {
@@ -211,6 +240,25 @@ class BaseRecovery(AnalysisPass):
             score = assessment.score + generic + 1.5 * seed_weights.get(candidate, 0.0)
             supporting = [item for item in assessment.evidence if item.supports]
             contradicting = [item for item in assessment.evidence if not item.supports]
+
+            if layout is not None and candidate in layout.flash:
+                # Enough to settle a close call, not enough to overrule an
+                # image whose own evidence points elsewhere.
+                preference = DEVICE_LAYOUT_WEIGHT * (1.0 if candidate == layout.flash[0] else 0.6)
+                score += preference
+                supporting.insert(
+                    0,
+                    Evidence(
+                        kind="device_layout",
+                        source=self.name,
+                        explanation=(
+                            f"{candidate:#010x} is where {layout.family} maps Flash, "
+                            f"as {layout.matched} indicates"
+                        ),
+                        value=candidate,
+                        weight=preference,
+                    ),
+                )
             if candidate in seed_evidence:
                 supporting.insert(0, seed_evidence[candidate])
             if resolved:

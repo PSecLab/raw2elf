@@ -41,6 +41,12 @@ class Options:
     #: Explicit SVD file, or a directory to search.
     svd: Optional[str] = None
     enable_svd: bool = True
+    #: Download the CMSIS-SVD database when no local copy is found.
+    #:
+    #: Off by default, because a library call should never reach the network
+    #: on its own. The command line turns it on, since a person running the
+    #: tool should not have to go and find the database first.
+    fetch_svd: bool = False
     svd_symbols: str = "peripherals"  # none | peripherals | registers
     minimum_confidence: float = 0.5
     fail_on_ambiguity: bool = False

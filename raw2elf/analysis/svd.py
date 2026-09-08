@@ -29,11 +29,9 @@ from ..core.evidence import Evidence
 from ..core.pipeline import AnalysisContext, AnalysisPass
 from ..core.reference import Access
 from ..core.util import hexs
+from .devices import normalise, search
+from .svdsource import SvdSource, default_cache_directory, open_source
 
-#: Environment variable naming a CMSIS-SVD data directory.
-SVD_DIR_ENVIRONMENT = "RAW2ELF_SVD_DIR"
-#: Directory names to look for while walking up from the working directory.
-_REPO_HINTS = ("cmsis-svd-data/data", "third_party/cmsis-svd-data/data", "svd")
 #: Default window when a peripheral declares no address block.  Kept tight:
 #: a generous default makes neighbouring peripherals overlap, and an access
 #: then gets attributed to whichever one happens to be listed first.
@@ -78,7 +76,8 @@ class Device:
 
     name: str
     vendor: str
-    path: str
+    #: Opaque handle the source understands; a path, or a path within a repo.
+    locator: str
     cpu: str = ""
     peripherals: tuple[Peripheral, ...] = ()
     interrupts: tuple[Interrupt, ...] = ()
@@ -137,33 +136,6 @@ def _integer(text: str) -> Optional[int]:
 # -- indexing --------------------------------------------------------------
 
 
-def find_svd_root(explicit: Optional[str] = None) -> Optional[Path]:
-    """Locate a CMSIS-SVD data directory."""
-    if explicit:
-        candidate = Path(explicit).expanduser()
-        if candidate.exists():
-            return candidate
-        return None
-    environment = os.environ.get(SVD_DIR_ENVIRONMENT)
-    if environment and Path(environment).expanduser().is_dir():
-        return Path(environment).expanduser()
-    for directory in [Path.cwd(), *Path.cwd().parents]:
-        for hint in _REPO_HINTS:
-            candidate = directory / hint
-            if candidate.is_dir():
-                return candidate
-    try:
-        import cmsis_svd  # noqa: PLC0415 - optional dependency probed lazily
-
-        packaged = Path(cmsis_svd.__file__).parent / "data"
-        if packaged.is_dir():
-            return packaged
-    except Exception:  # pragma: no cover - absence is the normal case
-        pass
-    home = Path.home() / ".cmsis-svd" / "data"
-    return home if home.is_dir() else None
-
-
 #: Matches a peripheral's opening tag; the header that follows holds the
 #: name and base address.
 _PERIPHERAL_TAG = re.compile(r"<peripheral\b[^>]*>")
@@ -179,7 +151,9 @@ _INTERRUPT = re.compile(
 _CPU_NAME = re.compile(r"<cpu>.*?<name>([^<]+)</name>", re.DOTALL)
 
 
-def parse_index_entry(path: Path, vendor: str) -> Optional[Device]:
+def parse_index_entry(
+    text: str, vendor: str = "", name_hint: str = "", locator: str = ""
+) -> Optional[Device]:
     """Extract peripheral bases and interrupt numbers from one SVD file.
 
     The vendor database is several gigabytes of XML whose bulk is register and
@@ -189,10 +163,6 @@ def parse_index_entry(path: Path, vendor: str) -> Optional[Device]:
     expressions.  The shortlisted devices are parsed properly later, where
     correctness around clusters and derived peripherals actually matters.
     """
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
     if "<device" not in text or "<peripheral" not in text:
         return None
 
@@ -242,9 +212,9 @@ def parse_index_entry(path: Path, vendor: str) -> Optional[Device]:
     device = _NAME.search(text[: starts[0]])
     cpu = _CPU_NAME.search(text[: starts[0]])
     return Device(
-        name=device.group(1).strip() if device else path.stem,
+        name=device.group(1).strip() if device else name_hint,
         vendor=vendor,
-        path=str(path),
+        locator=locator,
         cpu=cpu.group(1).strip() if cpu else "",
         peripherals=tuple(peripherals),
         interrupts=tuple(Interrupt(name, value) for value, name in sorted(interrupts.items())),
@@ -299,7 +269,7 @@ def _peripheral_spans(text: str) -> list[_Span]:
     return spans
 
 
-def parse_registers(path: str, bases: Optional[Iterable[int]] = None) -> list[Register]:
+def parse_registers(text: str, bases: Optional[Iterable[int]] = None) -> list[Register]:
     """Parse registers from one SVD file.
 
     ``bases`` restricts the work to the peripherals at those exact base
@@ -308,11 +278,6 @@ def parse_registers(path: str, bases: Optional[Iterable[int]] = None) -> list[Re
     candidate device costs a fraction of parsing it.  Derived peripherals are
     resolved against the peripheral they copy.
     """
-    try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return []
-
     spans = _peripheral_spans(text)
     by_name = {span.name: span for span in spans if span.name}
     wanted = None if bases is None else set(bases)
@@ -386,16 +351,16 @@ def _registers_in(
 
 
 class SvdDatabase:
-    """A lazily built, on-disk-cached index of a CMSIS-SVD tree."""
+    """A lazily built, on-disk-cached index over an :class:`SvdSource`."""
 
-    def __init__(self, root: Path, cache_directory: Optional[Path] = None) -> None:
-        self.root = root
-        self.cache_directory = cache_directory or _default_cache_directory()
+    def __init__(self, source: SvdSource, cache_directory: Optional[Path] = None) -> None:
+        self.source = source
+        self.cache_directory = cache_directory or default_cache_directory()
         self.devices: list[Device] = []
 
     def load(self, log=None) -> list[Device]:
         cache = self._cache_path()
-        signature = self._signature()
+        signature = f"{_INDEX_VERSION}:{self.source.signature()}"
         if cache.exists():
             try:
                 payload = json.loads(cache.read_text())
@@ -404,14 +369,17 @@ class SvdDatabase:
                     return self.devices
             except Exception:
                 pass
+
         if log:
-            log(f"building CMSIS-SVD index from {self.root} (first run only)")
-        self.devices = []
-        for path in sorted(self.root.rglob("*.svd")):
-            vendor = path.parent.name
-            device = parse_index_entry(path, vendor)
-            if device is not None:
-                self.devices.append(device)
+            log(f"indexing CMSIS-SVD data from {self.source.description} (first run only)")
+        self.devices = [
+            device
+            for device in (
+                parse_index_entry(text, entry.vendor, entry.name, entry.locator)
+                for entry, text in self._contents()
+            )
+            if device is not None
+        ]
         try:
             cache.parent.mkdir(parents=True, exist_ok=True)
             cache.write_text(
@@ -427,28 +395,33 @@ class SvdDatabase:
             pass
         return self.devices
 
-    def _signature(self) -> str:
-        files = sorted(self.root.rglob("*.svd"))
-        newest = max((path.stat().st_mtime_ns for path in files), default=0)
-        return f"{_INDEX_VERSION}:{len(files)}:{newest}"
+    def _contents(self):
+        """Every file's text, batched where the source supports it."""
+        batched = getattr(self.source, "read_all", None)
+        if batched is not None:
+            yield from batched()
+            return
+        for entry in self.source.entries():
+            text = self.source.read(entry.locator)
+            if text is not None:
+                yield entry, text
+
+    def read(self, device: Device) -> str:
+        """The full text of one device's SVD file."""
+        return self.source.read(device.locator) or ""
 
     def _cache_path(self) -> Path:
         import hashlib
 
-        digest = hashlib.sha256(str(self.root.resolve()).encode()).hexdigest()[:16]
+        digest = hashlib.sha256(self.source.identity.encode()).hexdigest()[:16]
         return self.cache_directory / f"svd-index-{digest}.json"
-
-
-def _default_cache_directory() -> Path:
-    base = os.environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
-    return Path(base) / "raw2elf"
 
 
 def _device_to_json(device: Device) -> dict[str, Any]:
     return {
         "name": device.name,
         "vendor": device.vendor,
-        "path": device.path,
+        "locator": device.locator,
         "cpu": device.cpu,
         "peripherals": [
             [item.name, item.base, item.window, item.group] for item in device.peripherals
@@ -461,7 +434,7 @@ def _device_from_json(payload: dict[str, Any]) -> Device:
     return Device(
         name=payload["name"],
         vendor=payload["vendor"],
-        path=payload["path"],
+        locator=payload.get("locator", payload.get("path", "")),
         cpu=payload.get("cpu", ""),
         peripherals=tuple(
             Peripheral(name=item[0], base=item[1], window=item[2], group=item[3])
@@ -546,6 +519,26 @@ def common_family(names: Iterable[str]) -> str:
     return prefix
 
 
+class _SingleFile(SvdSource):
+    """A source wrapping one SVD file the analyst pointed at."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.identity = f"file:{path.resolve()}"
+        self.description = str(path)
+
+    def entries(self):
+        from .svdsource import SvdEntry
+
+        return [SvdEntry(locator=str(self.path), vendor=self.path.parent.name, name=self.path.stem)]
+
+    def read(self, locator: str) -> Optional[str]:
+        try:
+            return Path(locator).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+
 def implied_bases(accesses) -> list[int]:
     """The peripheral base addresses the recovered accesses imply."""
     bases: set[int] = set()
@@ -598,7 +591,7 @@ def describe_tie(tied: list["Match"]) -> tuple[str, "Match"]:
 
 
 def rank_devices(
-    devices: Iterable[Device], accesses, log=None
+    devices: Iterable[Device], accesses, database: Optional["SvdDatabase"] = None, log=None
 ) -> list[Match]:
     """Rank devices against recovered MMIO accesses, best first."""
     by_address: dict[int, list] = {}
@@ -659,7 +652,8 @@ def rank_devices(
         log(f"svd: {len(shortlist)} candidate(s) go to register-level scoring")
 
     for match in shortlist:
-        registers = parse_registers(match.device.path, bases=recovered_bases or None)
+        text = database.read(match.device) if database is not None else ""
+        registers = parse_registers(text, bases=recovered_bases or None) if text else []
         by_register = {register.address: register for register in registers}
         hits = 0
         contradictions = 0
@@ -712,38 +706,58 @@ class SvdMatcher(AnalysisPass):
         context.provide("svd_annotations", {})
 
         explicit = context.options.svd
+        database = None
         if explicit and Path(explicit).is_file():
-            device = parse_index_entry(Path(explicit), Path(explicit).parent.name)
+            path = Path(explicit)
+            device = parse_index_entry(
+                path.read_text(encoding="utf-8", errors="replace"),
+                path.parent.name,
+                path.stem,
+                str(path),
+            )
             if device is None:
                 context.warn(f"could not parse {explicit} as a CMSIS-SVD file")
                 return
             devices = [device]
+            database = SvdDatabase(_SingleFile(path))
         else:
-            root = find_svd_root(explicit)
-            if root is None:
+            source = open_source(
+                explicit,
+                allow_fetch=context.options.fetch_svd,
+                log=lambda message: context.log(message, level=0),
+            )
+            if source is None:
                 context.warn(
-                    "no CMSIS-SVD data found; set RAW2ELF_SVD_DIR or pass --svd to enable "
-                    "MCU identification"
+                    "no CMSIS-SVD data found, so no MCU can be identified"
+                    + ("" if context.options.fetch_svd else " (it was not fetched)")
                 )
                 return
-            devices = SvdDatabase(root).load(log=lambda message: context.log(message, level=1))
-            context.log(f"svd: indexed {len(devices)} device(s) from {root}", level=1)
+            database = SvdDatabase(source)
+            devices = database.load(log=lambda message: context.log(message, level=0))
+            context.log(f"svd: indexed {len(devices)} device(s)", level=1)
 
         if context.options.mcu:
-            wanted = context.options.mcu.lower()
-            devices = [device for device in devices if device.name.lower() == wanted] or [
-                device for device in devices if wanted in device.name.lower()
+            # What is printed on a package carries package, grade and speed
+            # suffixes that no SVD file names, so matching is loose.
+            wanted = context.options.mcu
+            devices = search(wanted, devices) or [
+                device for device in devices if normalise(wanted) == normalise(device.name)
             ]
             if not devices:
-                context.warn(f"no SVD device matches --mcu {context.options.mcu!r}")
+                context.warn(f"no SVD device resembles --mcu {wanted!r}")
                 return
+            context.log(
+                f"svd: {wanted} matched {', '.join(item.name for item in devices[:4])}", level=1
+            )
 
         if len(accesses) == 0:
             context.warn("no MMIO accesses were recovered, so no MCU can be identified")
             return
 
         distinct = len({reference.value for reference in accesses})
-        matches = rank_devices(devices, accesses, log=lambda message: context.log(message, level=2))
+        matches = rank_devices(
+            devices, accesses, database=database, log=lambda message: context.log(message, level=2)
+        )
         if not matches:
             context.note(
                 Evidence(
@@ -833,6 +847,7 @@ class SvdMatcher(AnalysisPass):
                 confidence=selected.confidence,
             )
         )
+        context.provide("_svd_database", database)
         context.provide("svd_annotations", self._annotations(context, selected))
         context.log(f"mcu: {label} confidence {selected.confidence:.2f}", level=1)
 
@@ -866,9 +881,11 @@ class SvdMatcher(AnalysisPass):
         }
 
         if level == "registers":
+            database = context.get("_svd_database")
+            text = database.read(match.device) if database is not None else ""
             registers = parse_registers(
-                match.device.path, bases=[peripheral.base for peripheral in used.values()]
-            )
+                text, bases=[peripheral.base for peripheral in used.values()]
+            ) if text else []
             annotations["registers"] = [
                 {
                     "name": f"{register.peripheral}_{register.name}",

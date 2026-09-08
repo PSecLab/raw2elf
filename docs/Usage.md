@@ -221,9 +221,10 @@ raw2elf firmware.bin \
 
 | Option | Effect |
 | --- | --- |
-| `--mcu NAME` | Assume this part instead of ranking candidates. |
+| `--mcu NAME` | The part number, as printed on the package. Suffixes are ignored. Constrains the load address and skips MCU ranking. |
 | `--svd PATH` | An SVD file, or a directory to search. |
 | `--no-svd` | Skip MCU identification entirely. |
+| `--no-svd-fetch` | Do not download the CMSIS-SVD database when no local copy is found. |
 | `--svd-symbols LEVEL` | `none`, `peripherals` (default), or `registers`. |
 
 ### Confidence policy
@@ -284,60 +285,65 @@ Repeating `-v` adds per-pass timing. Everything shown here, and more, is in the
 
 ## Interactive sessions
 
-`-i` / `--interactive` turns a refusal into a question instead of an error.
+`-i` / `--interactive` asks rather than refusing.
 
-It is not a configuration wizard, and it does not walk you through settings the
-analysis can work out for itself: on a straightforward image it asks nothing at
-all. It speaks up in exactly two situations — where recovery would otherwise
-have refused, and where the input holds more than one firmware image, since
-which one you want is not something the bytes can say.
+It is not a configuration wizard, and it does not ask you to make judgements
+about binaries. On a straightforward image it asks nothing at all.
+
+What it does ask is what you can see:
 
 ```
-$ raw2elf odd.bin -o odd.elf --interactive
+$ raw2elf mystery.bin -o mystery.elf --interactive
 
-best runtime base address candidate 0x07f00000 has confidence 0.31,
-below the required 0.50
-
-  1) 0x07f00000  confidence 0.31  (backend seed)
-       + vector table lands at 0x07f00000, aligned to 0x100000
-       - handlers would lie up to 1.0 MiB past their own vector table
-  2) 0x08000000  confidence 0.28  (reference value aligned to 0x1000000)
-       + all handlers lie within 0x318 bytes after their own vector table
-       - none of the 4 resolvable exception handlers decode as Thumb code
-  ... 6 further candidate(s) scored lower and are not shown
-  e) enter a value
-  q) abort
-Select runtime base address [1]: 2
-  using 0x08000000
+What is printed on the chip? (Enter to skip; raw2elf will work it out)
+  for example STM32F407VGT6, nRF52840 or LPC1768
+> STM32F407VGT6
+  the STM32 family maps Flash at 0x08000000, 0x00000000 (Flash is also
+  aliased at 0 when booting from it)
 
 [...]
 
 Repeat without prompting:
-  raw2elf odd.bin --base 0x08000000 -o odd.elf
+  raw2elf mystery.bin --mcu STM32F407VGT6 -o mystery.elf
 ```
 
-Four properties are worth knowing:
+That one answer is the piece of evidence the image cannot contain. Where a
+firmware is loaded is a deduction; what the package says is an observation,
+and for most families it implies the answer. It is also the only question in
+the tool that does not require knowing anything about binaries.
+
+The part number is treated as evidence, not as an instruction. It is scored
+alongside everything else, so a firmware genuinely linked somewhere unusual
+still wins on its own evidence — naming an STM32 does not drag an image linked
+at `0x10000000` to `0x08000000`. Suffixes are ignored, so the full order code
+off the package works; `--mcu` does the same thing without a session.
+
+Where recovery still cannot decide, the candidates are offered, and `c` goes
+back to naming the chip:
+
+```
+  1) 0x07f00000  confidence 0.31  (backend seed)
+       - handlers would lie up to 1.0 MiB past their own vector table
+  2) 0x08000000  confidence 0.28
+  e) enter a value
+  c) name the chip instead, if you can read it off the board
+  q) abort
+```
+
+The remaining properties are worth knowing:
 
 **Being able to ask never lowers the bar for deciding.** The threshold and
 ambiguity rules run first and unchanged; a session is consulted only once a
-refusal has already been decided on. A run with `-i` reaches the same
-conclusions as one without, and simply has somewhere to go when there is no
-conclusion to reach.
-
-**`e` accepts an address the analysis never proposed.** That is the point of
-being asked: you may know the part, the datasheet or the boot configuration,
-none of which the image states.
+refusal has already been decided on.
 
 **`q`, or end-of-input, refuses exactly as an unattended run would** — same
 error, same exit code 3, nothing written.
 
 **It will not start without a terminal.** A piped or scheduled run would block
-on a prompt nobody can see, so `-i` with a non-terminal stdin is a usage error
-rather than a hang.
+on a prompt nobody can see, so `-i` with a non-terminal stdin is a usage error.
 
-The session ends by printing the equivalent non-interactive command, so
-whatever you settled interactively can go straight into a script. There is no
-session file to manage: the flags *are* the configuration.
+The session ends by printing the equivalent non-interactive command. There is
+no session file to manage: the flags *are* the configuration.
 
 ## When it refuses
 

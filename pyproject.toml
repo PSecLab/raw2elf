@@ -47,4 +47,5 @@ include = ["raw2elf*"]
 [tool.setuptools.package-data]
 # The reference firmwares travel with the package so that the evaluation
 # harness has its corpus after an install, without needing a cross toolchain.
-raw2elf = ["tests/fixtures/*.elf"]
+# The device layouts are data the tool cannot work without.
+raw2elf = ["tests/fixtures/*.elf", "analysis/*.json"]

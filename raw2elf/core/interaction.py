@@ -53,6 +53,15 @@ class Interaction:
         """
         raise NotImplementedError
 
+    def ask_text(self, question: str, hint: str = "") -> Optional[str]:
+        """Ask something free-form, such as what is printed on the chip.
+
+        This is the kind of question worth putting to a person: it asks what
+        they can see, not what they can deduce. Returning ``None`` means no
+        answer was given, which must always be a workable outcome.
+        """
+        return None
+
     def accepted(self, subject: str, label: str, confidence: Optional[float] = None) -> None:
         """Report a decision that was clear enough not to need asking."""
 
