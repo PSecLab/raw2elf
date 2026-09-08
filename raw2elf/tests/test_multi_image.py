@@ -245,3 +245,15 @@ def test_a_large_constant_table_is_not_mistaken_for_a_second_image(truth):
     # The 256 KiB of pseudo-random constants at 0x40000 contains no vector
     # table, however much of it decodes as Thumb.
     assert offsets == {0, 0x8000}
+
+
+def test_listing_images_gives_the_byte_range_of_each(dump, truth, capsys):
+    """A range is enough to carve a program out by hand."""
+    from raw2elf.report import console
+
+    context = _discover(dump)
+    listing = console.images(context.get("candidate_images"), "arm-cortex-m")
+    boot = len(truth["bootloader"].image)
+    application = len(truth["application_high"].image)
+    assert f"0x000000-0x{boot - 1:06x}" in listing
+    assert f"0x{APPLICATION_OFFSET:06x}-0x{APPLICATION_OFFSET + application - 1:06x}" in listing

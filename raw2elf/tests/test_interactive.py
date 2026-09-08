@@ -152,6 +152,9 @@ def test_a_multi_image_dump_offers_its_images(truth):
 
     assert "contain 2 separate programs" in session.output
     assert "the program at the very start of the dump" in session.output
+    # The byte range each option covers, so a choice can also be carved by hand.
+    assert "[0x000000-0x0003db]" in session.output
+    assert "[0x008000-0x0083db]" in session.output
     assert result.runtime_base == truth["application_high"].base
     assert session.chosen_flags == ["--image 1"]
 

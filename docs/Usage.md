@@ -343,11 +343,14 @@ with the safe answer first:
 This dump appears to contain 2 separate programs.
 If you are not sure, press Enter and the whole dump will be used.
 
-  1) analyse the whole dump together  (recommended)
-  2) just the program at the very start of the dump, 32K
-  3) just the program 192K into the dump, 876K
+  1) analyse the whole dump together  [0x000000-0x1fffff]  (recommended)
+  2) just the program at the very start of the dump, 32K  [0x000000-0x007fff]
+  3) just the program 192K into the dump, 876K  [0x030000-0x10afff]
   q) abort
 ```
+
+Each option carries the byte range it covers, so a choice can also be carved
+out by hand, and `--list-images` reports the same ranges.
 
 Only credible programs are offered: a candidate needs high confidence and at
 least 512 bytes, and if more than six qualify the question is dropped

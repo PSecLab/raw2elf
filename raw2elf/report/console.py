@@ -184,7 +184,8 @@ def images(candidates: Iterable, backend_name: str) -> str:
     lines: list[str] = []
     for index, item in enumerate(listing):
         lines.append(f"Image {index}")
-        lines.append(f"  Offset:        0x{item.image_offset:06x}")
+        end = item.image_offset + item.image_size - 1
+        lines.append(f"  Range:         0x{item.image_offset:06x}-0x{end:06x}")
         lines.append(f"  Size:          {human_size(item.image_size)} ({item.image_size} bytes)")
         lines.append(f"  Architecture:  {item.architecture}")
         if item.entry is not None:

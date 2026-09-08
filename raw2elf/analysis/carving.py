@@ -31,6 +31,11 @@ MIN_OFFERABLE_IMAGE = 512
 MAX_OFFERED = 6
 
 
+def _span(offset: int, size: int) -> str:
+    """The byte range a program occupies, so it can be carved by hand."""
+    return f"0x{offset:06x}-0x{offset + size - 1:06x}"
+
+
 def _where(offset: int, total: int) -> str:
     """Describe a position in a dump without requiring hex to be read."""
     if offset == 0:
@@ -189,7 +194,7 @@ class ImageDiscovery(AnalysisPass):
         choices = [
             Choice(
                 value=None,
-                label="analyse the whole dump together",
+                label=f"analyse the whole dump together  [{_span(0, total)}]",
                 origin="recommended",
                 flag="",
             )
@@ -197,7 +202,10 @@ class ImageDiscovery(AnalysisPass):
         choices.extend(
             Choice(
                 value=index,
-                label=f"just {_where(item.image_offset, total)}, {human_size(item.image_size)}",
+                label=(
+                    f"just {_where(item.image_offset, total)}, {human_size(item.image_size)}"
+                    f"  [{_span(item.image_offset, item.image_size)}]"
+                ),
                 confidence=item.confidence,
                 flag=f"--image {index}",
             )
