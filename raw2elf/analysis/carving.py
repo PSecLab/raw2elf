@@ -36,6 +36,20 @@ def _span(offset: int, size: int) -> str:
     return f"0x{offset:06x}-0x{offset + size - 1:06x}"
 
 
+def credible(hypothesis) -> bool:
+    """Whether a candidate is solid enough to act as a boundary or an option.
+
+    Weak candidates are still reported, because a wrong rejection should be
+    visible. They must not shape anything, though: a stray match inside a
+    program would otherwise cut that program short at the point where the
+    noise happened to land.
+    """
+    return (
+        hypothesis.confidence >= OFFER_CONFIDENCE
+        and hypothesis.image_size >= MIN_OFFERABLE_IMAGE
+    )
+
+
 def _where(offset: int, total: int) -> str:
     """Describe a position in a dump without requiring hex to be read."""
     if offset == 0:
@@ -175,17 +189,15 @@ class ImageDiscovery(AnalysisPass):
         if interaction is None:
             return None
 
-        credible = [
-            (index, item)
-            for index, item in enumerate(hypotheses)
-            if item.confidence >= OFFER_CONFIDENCE and item.image_size >= MIN_OFFERABLE_IMAGE
+        offerable = [
+            (index, item) for index, item in enumerate(hypotheses) if credible(item)
         ]
-        if len(credible) < 2 or len(credible) > MAX_OFFERED:
+        if len(offerable) < 2 or len(offerable) > MAX_OFFERED:
             # Nothing worth asking about, or too many to be a real question;
             # the whole dump is the right default either way.
-            if len(credible) > MAX_OFFERED:
+            if len(offerable) > MAX_OFFERED:
                 interaction.note(
-                    f"  {len(credible)} separate programs look possible; analysing the whole "
+                    f"  {len(offerable)} separate programs look possible; analysing the whole "
                     "dump. Use --list-images to see them."
                 )
             return None
@@ -209,13 +221,13 @@ class ImageDiscovery(AnalysisPass):
                 confidence=item.confidence,
                 flag=f"--image {index}",
             )
-            for index, item in credible
+            for index, item in offerable
         )
         picked = interaction.choose(
             "which program to reconstruct",
             choices,
             prompt=(
-                f"This dump appears to contain {len(credible)} separate programs.\n"
+                f"This dump appears to contain {len(offerable)} separate programs.\n"
                 "If you are not sure, press Enter and the whole dump will be used."
             ),
         )
@@ -231,10 +243,22 @@ class ImageDiscovery(AnalysisPass):
             if existing is None or candidate.confidence > existing.confidence:
                 best_at[candidate.image_offset] = candidate
 
+        # A program runs until the next *credible* program starts, not until
+        # the next thing that resembled one. Otherwise a stray match inside a
+        # program truncates it at the point the noise landed.
+        boundaries = sorted(
+            offset
+            for offset in offsets
+            if best_at[offset].confidence >= OFFER_CONFIDENCE
+        )
+
         hypotheses: list[ImageHypothesis] = []
-        for index, offset in enumerate(offsets):
+        for offset in offsets:
             candidate = best_at[offset]
-            following = offsets[index + 1] if index + 1 < len(offsets) else image.size
+            following = next(
+                (item for item in boundaries if item > offset),
+                image.size,
+            )
             end = self._trim(offset, following, padding)
             hypotheses.append(
                 ImageHypothesis(

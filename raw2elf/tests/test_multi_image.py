@@ -257,3 +257,49 @@ def test_listing_images_gives_the_byte_range_of_each(dump, truth, capsys):
     application = len(truth["application_high"].image)
     assert f"0x000000-0x{boot - 1:06x}" in listing
     assert f"0x{APPLICATION_OFFSET:06x}-0x{APPLICATION_OFFSET + application - 1:06x}" in listing
+
+
+def test_a_weak_candidate_does_not_truncate_a_real_program():
+    """A stray match inside a program must not cut it short.
+
+    Reported from a real STM32 dump: a false positive part way through the
+    application ended that application's extent exactly one byte before it,
+    so selecting the application would have carved out less than half of it.
+    Weak candidates are still reported -- a wrong rejection should be visible
+    -- but they do not get to shape anything.
+    """
+    from raw2elf.analysis.carving import OFFER_CONFIDENCE, credible
+    from raw2elf.arch.registry import get_backend
+    from raw2elf.core.hypothesis import EntryCandidate
+
+    total = 0x200000
+    image = FirmwareImage(
+        source_format="raw", segments=(FirmwareSegment(0, b"\xa5" * total),)
+    )
+    context = AnalysisContext(
+        image=image, backend=get_backend("arm-cortex-m"), options=Options()
+    )
+    candidates = [
+        EntryCandidate(kind="vector_table", image_offset=0x000000, confidence=1.0),
+        EntryCandidate(kind="vector_table", image_offset=0x020000, confidence=1.0),
+        # The stray match, well inside the second program.
+        EntryCandidate(
+            kind="vector_table", image_offset=0x0B3178, confidence=OFFER_CONFIDENCE - 0.1
+        ),
+    ]
+
+    hypotheses = ImageDiscovery()._build(context, candidates)
+    by_offset = {item.image_offset: item for item in hypotheses}
+
+    # The application runs to the end of the dump, not to the stray match.
+    application = by_offset[0x020000]
+    assert application.image_offset + application.image_size == total
+    assert application.image_size > 0x0B3178 - 0x020000
+
+    # The bootloader still ends where the application begins.
+    assert by_offset[0x000000].image_size == 0x020000
+
+    # The weak one is still reported, just not acted on.
+    assert 0x0B3178 in by_offset
+    assert not credible(by_offset[0x0B3178])
+    assert credible(application)
