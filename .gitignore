@@ -9,6 +9,8 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.eggs/
+pip-wheel-metadata/
 
 # Reconstruction output
 *.raw2elf.json

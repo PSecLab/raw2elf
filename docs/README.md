@@ -26,7 +26,7 @@ conclusion so a wrong answer can be traced rather than merely disbelieved.
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m raw2elf firmware.bin -o firmware.elf
+.venv/bin/raw2elf firmware.bin -o firmware.elf
 ```
 
 Python 3.10 or newer and [Capstone](https://www.capstone-engine.org/) are the

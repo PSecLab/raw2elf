@@ -12,8 +12,10 @@ conclusion so a wrong answer can be traced rather than merely disbelieved.
 git clone https://github.com/PSecLab/raw2elf.git && cd raw2elf
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m raw2elf firmware.bin -o firmware.elf
+.venv/bin/raw2elf firmware.bin -o firmware.elf
 ```
+
+Or without cloning: `pip install git+https://github.com/PSecLab/raw2elf.git`.
 
 Python 3.10+ and [Capstone](https://www.capstone-engine.org/) are the whole
 dependency list. Out come the ELF and `firmware.raw2elf.json`, a manifest
@@ -45,6 +47,7 @@ Full documentation is in [`docs/`](docs/):
 ## Layout
 
 ```
+pyproject.toml          packaging metadata and the raw2elf entry point
 docs/                   the documentation above
 raw2elf/                the package
 ├── input/              strict format detection and normalization

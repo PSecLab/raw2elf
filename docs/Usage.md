@@ -12,17 +12,28 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-Python 3.10 or newer, and Capstone is the only runtime dependency;
-`requirements.txt` adds pytest for the test suite. MCU identification
-additionally wants a CMSIS-SVD tree, and without one everything else still
-works — see [Recovery.md](Recovery.md#mcu-identification).
+That is an editable install of the package plus its test dependencies, so
+edits to the source take effect without reinstalling. For a plain install use
+`.venv/bin/pip install .`, and to install from the repository without cloning
+it first:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install git+https://github.com/PSecLab/raw2elf.git
+```
+
+Either way the environment gains a `raw2elf` command as well as the importable
+package.
+
+Python 3.10 or newer, and Capstone is the only runtime dependency; the `dev`
+extra adds pytest for the test suite. MCU identification additionally wants a
+CMSIS-SVD tree, and without one everything else still works — see
+[Recovery.md](Recovery.md#mcu-identification).
 
 ## Invoking it
 
-From a clone of this repository:
-
 ```bash
-.venv/bin/python -m raw2elf firmware.bin -o firmware.elf
+.venv/bin/raw2elf firmware.bin -o firmware.elf
 ```
 
 Activating the environment first is equivalent, and shorter if you are running
@@ -30,24 +41,25 @@ several commands:
 
 ```bash
 source .venv/bin/activate
-python -m raw2elf firmware.bin -o firmware.elf
+raw2elf firmware.bin -o firmware.elf
 ```
 
-From another directory, either put the directory containing the `raw2elf`
-package on `PYTHONPATH`, or point the interpreter straight at `cli.py`, which
-puts its own package directory on `sys.path`:
+The module form does the same thing and works from a clone with no install at
+all:
 
 ```bash
-/path/to/raw2elf/.venv/bin/python /path/to/raw2elf/raw2elf/cli.py firmware.bin -o firmware.elf
+.venv/bin/python -m raw2elf firmware.bin -o firmware.elf
 ```
 
-All of these are equivalent. The transcripts below shorten the invocation to
-`raw2elf` so the output stays readable; read it as
-`.venv/bin/python -m raw2elf`.
+Failing all of that, point the interpreter straight at `cli.py`, which puts its
+own package directory on `sys.path`:
 
-Without `-o` the ELF goes next to the input with an `.elf` suffix, and the
-manifest alongside it as `<name>.raw2elf.json`. `--report PATH` chooses the
-manifest path; `--no-report` skips it.
+```bash
+.venv/bin/python /path/to/raw2elf/raw2elf/cli.py firmware.bin -o firmware.elf
+```
+
+All of these are equivalent. The transcripts below use `raw2elf`, which is
+literally the command once the environment is active.
 
 ## A worked example
 

@@ -6,7 +6,9 @@
 .venv/bin/python -m pytest
 ```
 
-340 tests. The package ships its own `pytest.ini` so the suite is independent
+340 tests, against the installed package. `requirements.txt` performs an
+editable install, so the suite exercises the working tree rather than a stale
+copy. The package ships its own `pytest.ini` so the suite is independent
 of any enclosing project's pytest configuration, and `tests/conftest.py` puts
 the package's parent directory on `sys.path`, so the suite runs from anywhere.
 

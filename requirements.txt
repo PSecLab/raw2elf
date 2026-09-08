@@ -1,4 +1,3 @@
-# raw2elf needs a disassembler and nothing else.
-capstone>=5.0
-# Only for running the test suite.
-pytest>=7.0
+# Development install: the dependencies themselves live in pyproject.toml, so
+# there is one place to change them.
+-e .[dev]
