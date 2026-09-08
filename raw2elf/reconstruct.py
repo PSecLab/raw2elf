@@ -14,7 +14,7 @@ from .analysis import default_pipeline
 from .arch.base import ArchitectureBackend, ProbeResult
 from .arch.registry import get_backend, probe_all
 from .core.evidence import Evidence
-from .core.hypothesis import LowConfidenceError, choose
+from .core.hypothesis import LowConfidenceError, RecoveryRefused, choose
 from .core.image import FirmwareImage
 from .core.options import Options
 from .core.pipeline import AnalysisContext, PipelineResult
@@ -63,19 +63,25 @@ def select_backend(
 
     probes = probe_all(image)
     ranked = [(probe.backend, probe.confidence) for probe in probes]
-    if not ranked or ranked[0][1] < ARCHITECTURE_FLOOR:
-        raise LowConfidenceError(
+    try:
+        if not ranked or ranked[0][1] < ARCHITECTURE_FLOOR:
+            raise LowConfidenceError(
+                "architecture",
+                ranked[0][0] if ranked else "none",
+                ranked[0][1] if ranked else 0.0,
+                ARCHITECTURE_FLOOR,
+            )
+        name = choose(
             "architecture",
-            ranked[0][0] if ranked else "none",
-            ranked[0][1] if ranked else 0.0,
-            ARCHITECTURE_FLOOR,
+            ranked,
+            minimum_confidence=ARCHITECTURE_FLOOR,
+            fail_on_ambiguity=options.fail_on_ambiguity,
         )
-    name = choose(
-        "architecture",
-        ranked,
-        minimum_confidence=ARCHITECTURE_FLOOR,
-        fail_on_ambiguity=options.fail_on_ambiguity,
-    )
+    except RecoveryRefused as refusal:
+        # This happens before the pipeline builds a context, so the probe
+        # results are attached directly.
+        refusal.probes = probes
+        raise
     confidence = next(probe.confidence for probe in probes if probe.backend == name)
     return get_backend(name), confidence, probes
 
@@ -105,7 +111,13 @@ def reconstruct(image: FirmwareImage, options: Optional[Options] = None) -> Reco
         level=1,
     )
 
-    result = default_pipeline().run(context)
+    try:
+        result = default_pipeline().run(context)
+    except RecoveryRefused as refusal:
+        # Hand the caller everything the run did establish, so the refusal
+        # can be explained rather than merely announced.
+        refusal.context = context
+        raise
     return Reconstruction(
         image=image,
         backend=backend,

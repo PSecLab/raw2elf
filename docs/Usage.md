@@ -287,10 +287,28 @@ $ raw2elf odd.bin -o odd.elf
 raw2elf: best runtime base address candidate 0x07f00000 has confidence 0.31,
 below the required 0.50
 
-raw2elf will not emit an ELF it cannot justify. Supply the answer explicitly
-(--arch / --base / --entry / --vector-offset / --image), or lower
---minimum-confidence to accept the best candidate.
+Candidate load addresses:
+  1. 0x07f00000    confidence 0.31    (backend seed)
+       + vector table lands at 0x07f00000, aligned to 0x100000
+       + reset vector 0x08000319 maps to executable bytes
+       - handlers would lie up to 1.0 MiB past their own vector table
+  2. 0x08000000    confidence 0.28    (reference value aligned to 0x1000000)
+       + all handlers lie within 0x318 bytes after their own vector table
+       - none of the 4 resolvable exception handlers decode as Thumb code
+
+raw2elf will not emit an ELF it cannot justify. Any of these settles it:
+
+  --base 0x07f00000            take the best candidate
+  --minimum-confidence 0.30    accept it as it stands
 ```
+
+The candidates and their evidence are always shown, because a refusal that
+only announces a verdict leaves you with nothing to act on. The suggested
+flags are specific to the refusal: an ambiguity offers the tied candidates and
+`--fail-on-ambiguity` rather than a threshold, since raising a threshold
+cannot separate two answers that tie, and an unrecognized architecture offers
+`--arch` and `--probe`, since the architecture floor is fixed and
+`--minimum-confidence` would not move it.
 
 | Exit code | Meaning |
 | --- | --- |

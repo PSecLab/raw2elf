@@ -197,6 +197,134 @@ def images(candidates: Iterable, backend_name: str) -> str:
     return "\n".join(lines)
 
 
+#: Which context artifact holds the candidates for each refusal subject.
+_CANDIDATE_SOURCES = {
+    "runtime base address": "base_candidates",
+    "entry structure": "entry_candidates",
+    "architecture": "architecture_candidates",
+}
+
+
+def refusal(error) -> str:
+    """Explain a refusal: the candidates, their evidence, and what to supply.
+
+    A refusal that only announces a verdict leaves the analyst with nothing
+    to act on. What they need is the list the tool was choosing between, why
+    each one scored as it did, and the exact flag that would settle it.
+    """
+    context = getattr(error, "context", None)
+    subject = getattr(error, "subject", "")
+    lines: list[str] = [f"raw2elf: {error}", ""]
+
+    body = _candidate_listing(error, context, subject)
+    if body:
+        lines.extend(body)
+        lines.append("")
+
+    lines.append("raw2elf will not emit an ELF it cannot justify. Any of these settles it:")
+    lines.append("")
+    suggestions = _suggested_flags(error, context, subject)
+    width = max((len(flag) for flag, _why in suggestions), default=0) + 3
+    for flag, why in suggestions:
+        lines.append(f"  {flag.ljust(width)}{why}")
+    return "\n".join(lines)
+
+
+def _candidate_listing(error, context, subject: str) -> list[str]:
+    """The ranked candidates for whatever could not be decided."""
+    if subject == "architecture":
+        probes = getattr(error, "probes", None)
+        if probes is None and context is not None:
+            probes = context.get("architecture_candidates")
+        if not probes:
+            return []
+        lines = ["Candidate architectures:"]
+        for index, probe in enumerate(probes[:5], start=1):
+            lines.append(f"  {index}. {probe.backend:<20} confidence {probe.confidence:.2f}")
+            for item in list(probe.evidence)[:4]:
+                lines.append(f"       {item}")
+        return lines
+
+    if context is None:
+        return []
+
+    if subject == "entry structure":
+        candidates = context.get("entry_candidates") or []
+        if not candidates:
+            return []
+        lines = ["Candidate entry structures:"]
+        for index, candidate in enumerate(candidates[:5], start=1):
+            lines.append(
+                f"  {index}. {candidate.kind} at file offset 0x{candidate.image_offset:06x}"
+                f"    confidence {candidate.confidence:.2f}"
+            )
+            for item in candidate.evidence[:4]:
+                lines.append(f"       {item}")
+        return lines
+
+    candidates = context.get("base_candidates") or []
+    if not candidates:
+        return []
+    lines = ["Candidate load addresses:"]
+    for index, candidate in enumerate(candidates[:5], start=1):
+        lines.append(
+            f"  {index}. 0x{candidate.runtime_base:08x}    confidence {candidate.confidence:.2f}"
+            f"    ({candidate.origin})"
+        )
+        for item in candidate.supporting[:4]:
+            lines.append(f"       {item}")
+        for item in candidate.contradicting[:3]:
+            lines.append(f"       {item}")
+    return lines
+
+
+def _suggested_flags(error, context, subject: str) -> list[tuple[str, str]]:
+    """Concrete flags that would resolve this particular refusal."""
+    if subject == "architecture":
+        # The architecture floor is fixed, so --minimum-confidence would not
+        # move it; naming the backend is the only way through.
+        return [
+            ("--arch <name>", "name the architecture (--list-arch)"),
+            ("--probe", "show every backend's score and evidence"),
+        ]
+
+    flags: list[tuple[str, str]] = []
+    if subject == "entry structure":
+        flags.append(("--vector-offset <offset>", "name the entry structure"))
+        flags.append(("--entry <address>", "name the entry point outright"))
+
+    best = None
+    if context is not None and subject == "runtime base address":
+        candidates = context.get("base_candidates") or []
+        if candidates:
+            best = candidates[0]
+            flags.append((f"--base 0x{best.runtime_base:08x}", "take the best candidate"))
+
+    from ..core.hypothesis import AmbiguityError
+
+    if isinstance(error, AmbiguityError):
+        # Raising the threshold cannot separate two candidates that tie;
+        # either name one, or stop asking for a clear winner.
+        flags.append(("(drop --fail-on-ambiguity)", "accept the best of a close call"))
+    else:
+        confidence = getattr(error, "confidence", None)
+        if confidence:
+            # A threshold that would actually admit the best candidate,
+            # rather than "lower it" to some unspecified value.
+            flags.append(
+                (
+                    f"--minimum-confidence {max(confidence - 0.01, 0.0):.2f}",
+                    "accept it as it stands",
+                )
+            )
+        else:
+            flags.append(("--minimum-confidence <float>", "accept the best candidate"))
+
+    if not any(flag.startswith("--base") for flag, _why in flags):
+        flags.append(("--base <address>", "supply the load address directly"))
+    return flags
+
+
 def architectures(probes: Sequence, selected: Optional[str] = None) -> str:
     if not probes:
         return ""

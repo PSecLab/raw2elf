@@ -259,13 +259,7 @@ def _list_images(image, options: Options) -> int:
 
 
 def _report_uncertainty(error: Exception) -> int:
-    print(f"raw2elf: {error}", file=sys.stderr)
-    print(
-        "\nraw2elf will not emit an ELF it cannot justify. Supply the answer explicitly\n"
-        "(--arch / --base / --entry / --vector-offset / --image), or lower\n"
-        "--minimum-confidence to accept the best candidate.",
-        file=sys.stderr,
-    )
+    print(console.refusal(error), file=sys.stderr)
     return EXIT_AMBIGUOUS
 
 

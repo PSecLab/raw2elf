@@ -223,7 +223,7 @@ def test_fail_on_ambiguity_stops_a_close_call(tmp_path, capsys, monkeypatch, sta
     path.write_bytes(standard.image)
     code, _out, err = run([path, "--fail-on-ambiguity", "--no-svd"], capsys)
     assert code == cli.EXIT_AMBIGUOUS
-    assert "ambiguous" in err
+    assert "cannot choose a runtime base address" in err
     assert not path.with_suffix(".elf").exists()
 
 
@@ -268,3 +268,76 @@ def test_the_cli_runs_as_a_script(tmp_path, standard):
     )
     assert result.returncode == 0, result.stderr
     assert "ARM Cortex-M" in result.stdout
+
+
+# -- a refusal has to be actionable ----------------------------------------
+#
+# The specification asks that when the best candidate misses the threshold the
+# tool report the candidates, explain the evidence, and request an explicit
+# selection. A refusal that only announces a verdict leaves the analyst with
+# nothing to act on, so all three are checked.
+
+
+def test_a_low_confidence_refusal_lists_candidates_and_their_evidence(tmp_path, capsys):
+    path = tmp_path / "noise.bin"
+    path.write_bytes(bytes(((index * 7 + 11) & 0xFF) for index in range(4096)))
+    code, _out, err = run(
+        [path, "--arch", "arm-cortex-m", "--minimum-confidence", "0.9", "--no-svd"], capsys
+    )
+    assert code == cli.EXIT_AMBIGUOUS
+
+    assert "Candidate load addresses:" in err
+    assert err.count("confidence") >= 3        # the verdict plus ranked candidates
+    assert "+" in err and "-" in err           # supporting and contradicting evidence
+    # And a flag that would actually settle it, naming a real candidate.
+    assert "--base 0x" in err
+    assert "--minimum-confidence 0." in err
+    assert not path.with_suffix(".elf").exists()
+
+
+def test_an_ambiguity_refusal_names_the_tied_candidates(tmp_path, capsys, monkeypatch, standard):
+    from raw2elf.analysis import base_recovery
+
+    original = base_recovery._assign_confidence
+
+    def flatten(candidates):
+        original(candidates)
+        for candidate in candidates[:2]:
+            candidate.confidence = 0.66
+
+    monkeypatch.setattr(base_recovery, "_assign_confidence", flatten)
+
+    path = tmp_path / "mystery.bin"
+    path.write_bytes(standard.image)
+    code, _out, err = run([path, "--fail-on-ambiguity", "--no-svd"], capsys)
+
+    assert code == cli.EXIT_AMBIGUOUS
+    assert "too close to separate" in err
+    assert "Candidate load addresses:" in err
+    assert f"--base 0x{standard.base:08x}" in err
+    # Raising the threshold cannot separate a tie, so it must not be offered.
+    assert "--minimum-confidence" not in err
+    assert "drop --fail-on-ambiguity" in err
+
+
+def test_an_architecture_refusal_shows_the_probe_scores(tmp_path, capsys):
+    path = tmp_path / "tiny.bin"
+    path.write_bytes(b"\x00\x21\x08\x60\x70\x47" * 6)
+    code, _out, err = run([path, "--no-svd"], capsys)
+
+    assert code == cli.EXIT_AMBIGUOUS
+    assert "Candidate architectures:" in err
+    assert "arm-cortex-m" in err
+    assert "--arch <name>" in err and "--probe" in err
+    # The architecture floor is fixed, so this flag would not help.
+    assert "--minimum-confidence" not in err
+
+
+def test_a_refusal_still_explains_itself_without_an_analysis_context():
+    """The reporting must not depend on how far the run got."""
+    from raw2elf.core.hypothesis import LowConfidenceError
+    from raw2elf.report import console
+
+    rendered = console.refusal(LowConfidenceError("runtime base address", 0x08000000, 0.3, 0.5))
+    assert "0x08000000" in rendered
+    assert "--base <address>" in rendered

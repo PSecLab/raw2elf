@@ -106,27 +106,43 @@ class ImageHypothesis:
         }
 
 
-class AmbiguityError(RuntimeError):
+class RecoveryRefused(RuntimeError):
+    """Base class for a refusal to guess.
+
+    Carries the analysis context that produced it so the caller can report
+    the candidates and their evidence, rather than only the verdict.  A
+    refusal that does not say what the alternatives were leaves the analyst
+    with nothing to act on.
+    """
+
+    subject: str = ""
+    #: Set by the driver once the run unwinds; ``None`` if unavailable.
+    context: Any = None
+
+
+class AmbiguityError(RecoveryRefused):
     """Raised when candidates are too close to choose between safely."""
 
     def __init__(self, subject: str, candidates: list[tuple[int | str, float]]) -> None:
         self.subject = subject
         self.candidates = candidates
-        rendered = "\n".join(
-            f"  {index + 1}. {value if isinstance(value, str) else hexs(value, 8)}"
-            f"    confidence {confidence:.2f}"
-            for index, (value, confidence) in enumerate(candidates)
+        leaders = ", ".join(
+            f"{value if isinstance(value, str) else hexs(value, 8)} ({confidence:.2f})"
+            for value, confidence in candidates[:2]
         )
-        super().__init__(f"ambiguous {subject}; candidates:\n{rendered}")
+        super().__init__(
+            f"cannot choose a {subject}: {leaders} are too close to separate"
+        )
 
 
-class LowConfidenceError(RuntimeError):
+class LowConfidenceError(RecoveryRefused):
     """Raised when the best candidate does not meet the required confidence."""
 
     def __init__(self, subject: str, value: Any, confidence: float, threshold: float) -> None:
         self.subject = subject
         self.value = value
         self.confidence = confidence
+        self.threshold = threshold
         super().__init__(
             f"best {subject} candidate "
             f"{value if isinstance(value, str) else hexs(value, 8)} has confidence "
