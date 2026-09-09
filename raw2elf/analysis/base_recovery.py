@@ -51,8 +51,10 @@ class BaseRecovery(AnalysisPass):
     # Deliberately requires nothing: an analyst-supplied base, or an input
     # container that states its own addresses, needs no analysis at all, and a
     # backend that cannot recover references should still produce an ELF.
-    after = frozenset({"ReferenceRecovery", "EntryDiscovery"})
-    provides = frozenset({"runtime_base", "base_candidates", "entry", "base_confidence"})
+    after = frozenset({"ReferenceRecovery", "EntryDiscovery", "ImageDiscovery"})
+    provides = frozenset(
+        {"runtime_base", "base_candidates", "entry", "base_confidence", "selected_placement"}
+    )
     optional = False
 
     def run(self, context: AnalysisContext) -> None:
@@ -108,6 +110,7 @@ class BaseRecovery(AnalysisPass):
             level=1,
         )
         self._resolve_entry(context, base)
+        self._place(context, base)
 
     # -- candidate generation --------------------------------------------
 
@@ -287,6 +290,83 @@ class BaseRecovery(AnalysisPass):
         return results
 
     # -- entry ------------------------------------------------------------
+
+    def _place(self, context: AnalysisContext, base: int) -> None:
+        """Assemble the one placement every later stage works from.
+
+        Base, entry, entry structure and stack pointer are recovered by
+        different passes and only mean anything together. Assembling them
+        once, here, is what keeps a later stage from pairing this run's base
+        with some other image's entry.
+        """
+        candidate = context.get("selected_entry_candidate")
+        structure = None
+        initial_sp = None
+        start, size = 0, context.image.size
+        if candidate is not None:
+            structure = base + candidate.image_offset
+            initial_sp = candidate.details.get("initial_sp")
+            # The program is the image the entry structure heads, which is
+            # not necessarily the whole input. A dump whose first 128 KiB are
+            # erased is not a program that begins 128 KiB before its own
+            # vector table; treating it as one is what puts a Cortex-M image
+            # at an address no Cortex-M part has any flash at.
+            own = next(
+                (
+                    item
+                    for item in (context.get("candidate_images") or ())
+                    if item.image_offset == candidate.image_offset
+                ),
+                None,
+            )
+            if own is not None and own.image_size:
+                start, size = own.image_offset, own.image_size
+
+        placement = context.placement_for(
+            image_offset=start,
+            image_size=size,
+            runtime_base=base + start,
+            entry_structure=structure,
+            entry=context.get("entry"),
+            initial_stack_pointer=initial_sp,
+            confidence=context.get("base_confidence", 0.0) or 0.0,
+        )
+        context.provide("selected_placement", placement)
+        if start:
+            context.note(
+                Evidence(
+                    kind="placement",
+                    source=self.name,
+                    explanation=(
+                        f"the program occupies {size} bytes from file offset {start:#x}; "
+                        f"it loads at {placement.runtime_base:#010x}, and the bytes before it "
+                        "are not part of it"
+                    ),
+                    value=placement.runtime_base,
+                    weight=0.0,
+                )
+            )
+
+        if not placement.consistent:
+            # Every number is individually defensible and the combination
+            # describes no image that exists. Say so rather than emit it.
+            context.warn(
+                f"the recovered entry {placement.entry:#010x} lies outside the image placed at "
+                f"{placement.runtime_base:#010x}..{placement.runtime_end:#010x}; "
+                "base and entry may have come from different images"
+            )
+            context.note(
+                Evidence(
+                    kind="placement",
+                    source=self.name,
+                    explanation=(
+                        "the recovered base, entry and entry structure do not describe "
+                        "one image"
+                    ),
+                    supports=False,
+                    weight=2.0,
+                )
+            )
 
     def _resolve_entry(self, context: AnalysisContext, base: int) -> None:
         options = context.options

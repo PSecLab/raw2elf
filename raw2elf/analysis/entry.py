@@ -50,7 +50,10 @@ class EntryDiscovery(AnalysisPass):
             [
                 Choice(
                     value=candidate,
-                    label=f"{candidate.kind} at file offset 0x{candidate.image_offset:06x}",
+                    label=(
+                        f"{candidate.kind} at file offset "
+                        f"0x{context.file_offset_of(candidate.image_offset):06x}"
+                    ),
                     confidence=candidate.confidence,
                     evidence=[str(item) for item in candidate.evidence[:4]],
                     flag=f"--vector-offset 0x{candidate.image_offset:x}",

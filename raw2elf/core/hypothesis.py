@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
 from .evidence import Evidence, confidence_label
+from .placement import ImagePlacement
 from .util import hexs
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -79,26 +80,53 @@ class BaseCandidate:
 class ImageHypothesis:
     """A complete guess at one firmware image inside the input.
 
-    Every field describes the *same* image. A dump holding a bootloader and
-    an application has two of these, each with its own base, entry and entry
-    structure; mixing a base from one with an entry from another produces a
-    result that looks plausible and is wrong.
+    The geometry and the recovered facts live together in one
+    :class:`~raw2elf.core.placement.ImagePlacement`, so a hypothesis cannot
+    be built with a base from one image and an entry from another without
+    that being visible.  A dump holding a bootloader and an application has
+    two of these, each fully describing its own image.
     """
 
     architecture: str
-    image_offset: int
-    image_size: int
-    runtime_base: Optional[int] = None
-    entry: Optional[int] = None
-    #: Runtime address of the structure the entry came from.
-    entry_structure: Optional[int] = None
-    #: Reset-time stack pointer, where the architecture has one.
-    initial_stack_pointer: Optional[int] = None
+    placement: ImagePlacement
     score: float = 0.0
-    confidence: float = 0.0
     evidence: list[Evidence] = field(default_factory=list)
     contradictions: list[Evidence] = field(default_factory=list)
     details: dict[str, Any] = field(default_factory=dict)
+
+    # -- the placement is the hypothesis; these read through to it --------
+
+    @property
+    def file_offset(self) -> int:
+        return self.placement.file_offset
+
+    @property
+    def image_offset(self) -> int:
+        return self.placement.image_offset
+
+    @property
+    def image_size(self) -> int:
+        return self.placement.image_size
+
+    @property
+    def runtime_base(self) -> Optional[int]:
+        return self.placement.runtime_base
+
+    @property
+    def entry(self) -> Optional[int]:
+        return self.placement.entry
+
+    @property
+    def entry_structure(self) -> Optional[int]:
+        return self.placement.entry_structure
+
+    @property
+    def initial_stack_pointer(self) -> Optional[int]:
+        return self.placement.initial_stack_pointer
+
+    @property
+    def confidence(self) -> float:
+        return self.placement.confidence
 
     @property
     def label(self) -> str:
@@ -107,14 +135,8 @@ class ImageHypothesis:
     def as_dict(self) -> dict[str, Any]:
         return {
             "architecture": self.architecture,
-            "image_offset": hexs(self.image_offset, 6),
-            "image_size": self.image_size,
-            "runtime_base": hexs(self.runtime_base, 8),
-            "entry": hexs(self.entry, 8),
-            "entry_structure": hexs(self.entry_structure, 8),
-            "initial_stack_pointer": hexs(self.initial_stack_pointer, 8),
+            **self.placement.as_dict(),
             "score": round(self.score, 3),
-            "confidence": round(self.confidence, 3),
             "evidence": [str(item) for item in self.evidence],
             "contradictions": [str(item) for item in self.contradictions],
             "details": self.details,

@@ -12,7 +12,7 @@ range is an assumption that plenty of real parts break.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Optional
 
 from ..arch.base import ArchCapability
@@ -26,6 +26,7 @@ from ..core.memory import (
     StartupState,
 )
 from ..core.pipeline import AnalysisContext, AnalysisPass
+from ..core.provenance import CodeProvenance
 from ..core.reference import Access, ReferenceKind, ReferenceSet
 from .devices import layout_for
 from ..core.util import align_down, align_up, human_size
@@ -47,29 +48,98 @@ PADDING_TRIM_THRESHOLD = 0x10000
 MIN_REGION_CONFIDENCE = 0.25
 #: At or above this a region counts as established rather than speculative.
 ESTABLISHED_CONFIDENCE = 0.6
+#: A region below this architectural plausibility stays speculative however
+#: good its other evidence: memory that needs a controller configured before
+#: it answers is not established by a handful of stores.
+PLAUSIBLE_ENOUGH = 0.5
+#: The most that untrusted code can contribute to a region's score, no matter
+#: how many accesses it makes. Weak evidence repeated is still weak evidence,
+#: and a linear sweep over a compressed asset produces a great deal of it.
+UNTRUSTED_CEILING = 0.6
+
+
+@dataclass
+class AccessEvidence:
+    """What one cluster of addresses rests on, kept apart by trust.
+
+    Trusted and untrusted accesses are counted separately rather than summed,
+    because they differ in kind. Ten stores from a function the reset path
+    reaches say the memory is there; ten stores from bytes that merely
+    decoded say the bytes decoded.
+    """
+
+    #: Addresses reached by code something is known to reach.
+    trusted_addresses: set = field(default_factory=set)
+    #: Instruction offsets in trusted code that reached them.
+    trusted_sites: set = field(default_factory=set)
+    #: Distinct discovered functions those instructions belong to.
+    functions: set = field(default_factory=set)
+    #: Addresses trusted code writes to.
+    writes: set = field(default_factory=set)
+    #: Every address in the cluster, trusted or not.
+    addresses: set = field(default_factory=set)
+    #: Summed weight of the untrusted accesses, before the ceiling.
+    untrusted_weight: float = 0.0
+    untrusted_sites: set = field(default_factory=set)
+    #: The best reason any contributing instruction is believed to be code.
+    best_provenance: Optional[CodeProvenance] = None
+
+    def record(self, reference) -> None:
+        self.addresses.add(reference.value)
+        provenance = reference.code_provenance
+        if self.best_provenance is None or provenance.rank < self.best_provenance.rank:
+            self.best_provenance = provenance
+        if reference.trusted:
+            self.trusted_addresses.add(reference.value)
+            self.trusted_sites.add(reference.source_offset)
+            if reference.source_function is not None:
+                self.functions.add(reference.source_function)
+            if reference.access == Access.WRITE:
+                self.writes.add(reference.value)
+        else:
+            self.untrusted_weight += provenance.weight
+            self.untrusted_sites.add(reference.source_offset)
+
+    def restricted_to(self, addresses: set) -> "AccessEvidence":
+        """The part of this evidence concerning ``addresses``."""
+        return AccessEvidence(
+            trusted_addresses=self.trusted_addresses & addresses,
+            trusted_sites=set(self.trusted_sites),
+            functions=set(self.functions),
+            writes=self.writes & addresses,
+            addresses=self.addresses & addresses,
+            untrusted_weight=self.untrusted_weight,
+            untrusted_sites=set(self.untrusted_sites),
+            best_provenance=self.best_provenance,
+        )
 
 
 def _region_confidence(
     name: str,
-    addresses: set,
-    instructions: set,
-    writes: set,
+    evidence: "AccessEvidence",
     anchored: bool,
     layout,
+    plausibility: float = 0.5,
 ) -> tuple:
     """How much a cluster of accesses is worth believing.
 
-    Weighted by what the evidence *is*, not how much of it there is. One
-    instruction reaching one address is a fact about that instruction; a
-    dozen instructions reaching a dozen addresses, some of them writing, is
-    a memory region. Startup boundaries and a known part's memory map settle
-    it either way.
+    Weighted by what the evidence *is*, not how much of it there is. The
+    largest single factor is whether the instructions making the accesses are
+    known to be executed at all: a valid instruction encoding is not the same
+    thing as known executable code, and a page of compressed data decodes into
+    plenty of well-formed stores whose effective addresses look exactly like
+    real ones.
+
+    Untrusted accesses are not ignored -- they are capped, at a level that
+    cannot on its own carry a region past ``ESTABLISHED_CONFIDENCE``, however
+    many of them there are.
     """
     from ..core.evidence import Evidence
     from ..core.util import logistic
 
     notes = []
     score = 0.0
+
     if anchored:
         score += 3.0
         notes.append(
@@ -80,34 +150,76 @@ def _region_confidence(
                 weight=3.0,
             )
         )
-    if writes:
+
+    if evidence.writes:
         score += 1.5
         notes.append(
             Evidence(
                 kind="region",
                 source="MemoryRegionRecovery",
-                explanation=f"{len(writes)} address(es) in this range are written",
-                value=len(writes),
+                explanation=(
+                    f"{len(evidence.writes)} address(es) in this range are written by "
+                    "code that is reached"
+                ),
+                value=len(evidence.writes),
                 weight=1.5,
             )
         )
-    score += min(len(instructions) * 0.4, 2.0)
-    score += min(len(addresses) * 0.3, 1.5)
-    notes.append(
-        Evidence(
-            kind="region",
-            source="MemoryRegionRecovery",
-            explanation=(
-                f"{len(instructions)} instruction(s) reach {len(addresses)} distinct "
-                f"{name} address(es)"
-            ),
-            value=len(instructions),
+
+    if evidence.trusted_sites:
+        score += min(len(evidence.trusted_sites) * 0.4, 2.0)
+        score += min(len(evidence.trusted_addresses) * 0.3, 1.5)
+        provenance = evidence.best_provenance
+        notes.append(
+            Evidence(
+                kind="region",
+                source="MemoryRegionRecovery",
+                explanation=(
+                    f"{len(evidence.trusted_sites)} instruction(s) in reachable code "
+                    f"({provenance.value.lower().replace('_', ' ')}) reach "
+                    f"{len(evidence.trusted_addresses)} distinct {name} address(es)"
+                ),
+                value=len(evidence.trusted_sites),
+            )
         )
-    )
+
+    # Independently reached functions are much better evidence than the same
+    # number of accesses from one block: two functions agreeing that memory
+    # is here is a corroboration, twenty stores in a row is one opinion.
+    independent = len(evidence.functions)
+    if independent > 1:
+        score += min((independent - 1) * 0.6, 1.8)
+        notes.append(
+            Evidence(
+                kind="region",
+                source="MemoryRegionRecovery",
+                explanation=f"{independent} independently reached functions access this range",
+                value=independent,
+                weight=min((independent - 1) * 0.6, 1.8),
+            )
+        )
+
+    if evidence.untrusted_weight:
+        contribution = min(evidence.untrusted_weight, UNTRUSTED_CEILING)
+        score += contribution
+        notes.append(
+            Evidence(
+                kind="region",
+                source="MemoryRegionRecovery",
+                explanation=(
+                    f"{len(evidence.untrusted_sites)} further access(es) come from bytes that "
+                    "decode as instructions but that nothing is known to execute"
+                ),
+                value=len(evidence.untrusted_sites),
+                weight=contribution,
+                supports=bool(evidence.trusted_sites),
+            )
+        )
+
     if layout and any(
         origin <= address < origin + LAYOUT_WINDOW
         for origin in layout
-        for address in addresses
+        for address in evidence.addresses
     ):
         score += 1.5
         notes.append(
@@ -118,6 +230,25 @@ def _region_confidence(
                 weight=1.5,
             )
         )
+
+    if plausibility < PLAUSIBLE_ENOUGH:
+        # Not a veto -- the evidence is still reported -- but this range needs
+        # a memory controller configured before it answers at all, so it takes
+        # much more than a few accesses to believe.
+        score -= 2.0
+        notes.append(
+            Evidence(
+                kind="region",
+                source="MemoryRegionRecovery",
+                explanation=(
+                    "this window needs external memory to have been configured before it "
+                    "responds, which the firmware was not seen to do"
+                ),
+                weight=2.0,
+                supports=False,
+            )
+        )
+
     return logistic(score, midpoint=2.5, steepness=0.9), notes
 
 
@@ -257,16 +388,12 @@ class MemoryRegionRecovery(AnalysisPass):
         references: ReferenceSet = context.get("references") or ReferenceSet()
         startup: Optional[StartupState] = context.get("startup_state")
 
-        #: address -> the instructions that reached it
-        touched: dict[int, set[int]] = {}
-        writes: set[int] = set()
+        evidence_at: dict[int, AccessEvidence] = {}
         for reference in references.of_kind(ReferenceKind.RAM):
             if not reference.access.touches_memory:
                 # A constant that looks like a RAM address is not a RAM bank.
                 continue
-            touched.setdefault(reference.value, set()).add(reference.source_offset)
-            if reference.access == Access.WRITE:
-                writes.add(reference.value)
+            evidence_at.setdefault(reference.value, AccessEvidence()).record(reference)
 
         anchors: dict[int, list[Evidence]] = {
             address: [
@@ -274,13 +401,14 @@ class MemoryRegionRecovery(AnalysisPass):
                     kind="ram_access",
                     source=self.name,
                     explanation=(
-                        f"{len(sites)} instruction(s) access {address:#010x}"
-                        + (" including a write" if address in writes else "")
+                        f"{len(item.trusted_sites) + len(item.untrusted_sites)} instruction(s) "
+                        f"access {address:#010x}"
+                        + (" including a write" if address in item.writes else "")
                     ),
                     value=address,
                 )
             ]
-            for address, sites in touched.items()
+            for address, item in evidence_at.items()
         }
 
         required: set[int] = set()
@@ -321,96 +449,158 @@ class MemoryRegionRecovery(AnalysisPass):
 
         layout = layout_for(context.options.mcu) if context.options.mcu else None
         regions: list[MemoryRegion] = []
-        for index, group in enumerate(cluster(anchors, RAM_BANK_GAP)):
-            members = set(group)
-            sites = {site for address in group for site in touched.get(address, ())}
-            confidence, notes = _region_confidence(
-                name="RAM",
-                addresses=members,
-                instructions=sites,
-                writes=writes & members,
-                anchored=bool(required & members),
+        for group in cluster(anchors, RAM_BANK_GAP):
+            region = self._region(
+                context,
+                kind=RegionKind.RAM,
+                label="RAM",
+                group=group,
+                evidence_at=evidence_at,
+                anchored=bool(required & set(group)),
                 layout=layout.ram if layout else (),
+                granularity=RAM_GRANULARITY,
+                name=f"ram{len(regions)}" if regions else "ram",
+                extra={address: anchors[address][:1] for address in sorted(group)[:4]},
             )
-            if confidence < MIN_REGION_CONFIDENCE:
-                continue
-            start = align_down(min(group), RAM_GRANULARITY)
-            end = align_up(max(group) + 1, RAM_GRANULARITY)
-            evidence: list[Evidence] = list(notes)
-            for address in sorted(group)[:4]:
-                evidence.extend(anchors[address][:1])
-            regions.append(
-                MemoryRegion(
-                    kind=RegionKind.RAM,
-                    start=start,
-                    size=end - start,
-                    name="ram" if index == 0 else f"ram{index}",
-                    writable=True,
-                    confidence=confidence,
-                    speculative=confidence < ESTABLISHED_CONFIDENCE,
-                    evidence=tuple(evidence[:6]),
-                )
-            )
+            if region is not None:
+                regions.append(region)
         return regions
 
     # -- mmio -------------------------------------------------------------
 
     def _mmio(self, context: AnalysisContext) -> list[MemoryRegion]:
         accesses = context.get("peripheral_accesses") or context.get("mmio_accesses") or []
-        touched: dict[int, set[int]] = {}
-        writes: set[int] = set()
+        evidence_at: dict[int, AccessEvidence] = {}
         for reference in accesses:
             if not reference.access.touches_memory:
                 continue
-            touched.setdefault(reference.value, set()).add(reference.source_offset)
-            if reference.access == Access.WRITE:
-                writes.add(reference.value)
-        if not touched:
+            evidence_at.setdefault(reference.value, AccessEvidence()).record(reference)
+        if not evidence_at:
             return []
 
         regions: list[MemoryRegion] = []
-        for index, group in enumerate(cluster(touched, MMIO_GAP)):
-            members = set(group)
-            sites = {site for address in group for site in touched[address]}
-            confidence, notes = _region_confidence(
-                name="peripheral",
-                addresses=members,
-                instructions=sites,
-                writes=writes & members,
+        for group in cluster(evidence_at, MMIO_GAP):
+            region = self._region(
+                context,
+                kind=RegionKind.MMIO,
+                label="peripheral",
+                group=group,
+                evidence_at=evidence_at,
                 anchored=False,
                 layout=(),
+                granularity=MMIO_GRANULARITY,
+                name=f"mmio{len(regions)}",
             )
-            if confidence < MIN_REGION_CONFIDENCE:
-                continue
-            start = align_down(min(group), MMIO_GRANULARITY)
-            end = align_up(max(group) + 1, MMIO_GRANULARITY)
-            regions.append(
-                MemoryRegion(
-                    kind=RegionKind.MMIO,
-                    start=start,
-                    size=end - start,
-                    name=f"mmio{index}",
-                    writable=True,
-                    confidence=confidence,
-                    speculative=confidence < ESTABLISHED_CONFIDENCE,
-                    evidence=tuple(notes),
-                )
-            )
+            if region is not None:
+                regions.append(region)
         return regions
+
+    # -- one region, and what it rests on ---------------------------------
+
+    def _region(
+        self,
+        context: AnalysisContext,
+        kind: RegionKind,
+        label: str,
+        group,
+        evidence_at: dict,
+        anchored: bool,
+        layout,
+        granularity: int,
+        name: str,
+        extra: Optional[dict] = None,
+    ) -> Optional[MemoryRegion]:
+        """Score one cluster and turn it into a region, or reject it."""
+        members = set(group)
+        combined = AccessEvidence()
+        for address in members:
+            item = evidence_at.get(address)
+            if item is None:
+                continue
+            combined.trusted_addresses |= item.trusted_addresses
+            combined.trusted_sites |= item.trusted_sites
+            combined.functions |= item.functions
+            combined.writes |= item.writes
+            combined.addresses |= item.addresses
+            combined.untrusted_weight += item.untrusted_weight
+            combined.untrusted_sites |= item.untrusted_sites
+            if item.best_provenance is not None and (
+                combined.best_provenance is None
+                or item.best_provenance.rank < combined.best_provenance.rank
+            ):
+                combined.best_provenance = item.best_provenance
+
+        # How likely this target is to have memory here at all. The backend
+        # knows its own address map; this code does not and must not.
+        plausibility = min(
+            (context.backend.region_plausibility(address) for address in members),
+            default=0.5,
+        )
+        confidence, notes = _region_confidence(
+            name=label,
+            evidence=combined,
+            anchored=anchored,
+            layout=layout,
+            plausibility=plausibility,
+        )
+        if confidence < MIN_REGION_CONFIDENCE:
+            return None
+
+        # Established means three things at once: reachable code made the
+        # accesses, there is enough of that evidence, and the target
+        # plausibly has memory here. Any one of them missing leaves the
+        # region reported but speculative.
+        established = (
+            confidence >= ESTABLISHED_CONFIDENCE
+            and (anchored or bool(combined.trusted_sites))
+            and plausibility >= PLAUSIBLE_ENOUGH
+        )
+        evidence: list[Evidence] = list(notes)
+        for items in (extra or {}).values():
+            evidence.extend(items)
+        return MemoryRegion(
+            kind=kind,
+            start=align_down(min(group), granularity),
+            size=align_up(max(group) + 1, granularity) - align_down(min(group), granularity),
+            name=name,
+            writable=True,
+            confidence=confidence,
+            speculative=not established,
+            evidence=tuple(evidence[:6]),
+        )
 
     # -- loadable segments ------------------------------------------------
 
     def _segments(self, context: AnalysisContext) -> list[LoadedSegment]:
-        """Firmware bytes paired with the addresses they occupy."""
+        """Firmware bytes paired with the addresses they occupy.
+
+        The bytes that reach the ELF are the program's, which is not always
+        the whole input: a dump may hold erased flash, a configuration block
+        or a second program before the one being reconstructed. Emitting
+        those as part of it places the program at an address it does not
+        occupy.
+        """
         segments: list[LoadedSegment] = []
         padding = context.get("padding") or []
         trim = bool(context.options.extra.get("trim_padding", True))
+        placement = context.get("selected_placement")
 
-        for index, segment in enumerate(context.image.iter_segments()):
+        for segment in context.image.iter_segments():
+            data = segment.data
+            image_offset = segment.image_offset
+            if placement is not None and placement.image_offset > 0:
+                low = max(image_offset, placement.image_offset)
+                high = min(segment.image_end, placement.image_offset + placement.image_size)
+                if low >= high:
+                    continue
+                data = data[low - image_offset : high - image_offset]
+                image_offset = low
             address = segment.address
             if address is None:
-                address = context.runtime_base + segment.image_offset
-            data = segment.data
+                address = context.runtime_base + image_offset
+            else:
+                address += image_offset - segment.image_offset
+            segment = replace(segment, image_offset=image_offset, data=data)
             if trim:
                 data, removed = _trim_tail(segment, padding)
                 if removed:
@@ -433,10 +623,10 @@ class MemoryRegionRecovery(AnalysisPass):
                 LoadedSegment(
                     address=address,
                     data=data,
-                    name="flash" if index == 0 else f"flash{index}",
+                    name="flash" if not segments else f"flash{len(segments)}",
                     executable=True,
                     writable=False,
-                    image_offset=segment.image_offset,
+                    image_offset=image_offset,
                 )
             )
         return segments

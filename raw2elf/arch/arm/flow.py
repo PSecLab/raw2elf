@@ -18,6 +18,7 @@ from typing import Callable, Iterable, Optional
 
 from capstone import arm as csarm
 
+from ...core.provenance import CodeProvenance
 from ...core.valueflow import UNKNOWN, Const, Lattice, State, Value, solve
 from .decoder import (
     Decoder,
@@ -62,6 +63,12 @@ class Function:
     calls: set[int] = field(default_factory=set)
     #: Addresses that are the target of a backward branch, i.e. loop heads.
     loop_headers: set[int] = field(default_factory=set)
+    #: Why these bytes are believed to be code at all.
+    provenance: CodeProvenance = CodeProvenance.LINEAR_SWEEP
+
+    @property
+    def trusted(self) -> bool:
+        return self.provenance.trusted
 
     @property
     def size(self) -> int:
@@ -88,30 +95,59 @@ class CodeGraph:
         self.instruction_count = 0
         self.exhausted = False
 
-    def discover(self, seeds: Iterable[int]) -> dict[int, Function]:
-        """Discover code reachable from ``seeds`` (runtime addresses)."""
-        pending = [address & ~1 for address in seeds]
-        seen_seeds: set[int] = set()
+    def discover(
+        self, seeds: Iterable[tuple[int, CodeProvenance] | int]
+    ) -> dict[int, Function]:
+        """Discover code reachable from ``seeds`` (runtime addresses).
+
+        Seeds are taken in order of how much they are trusted, and the first
+        reason to believe an address is code is the one that sticks.  Working
+        outwards from the most trustworthy seeds first means a function that
+        the reset path reaches is recorded as reset-reachable even if a
+        linear sweep also happened to guess it, without any re-labelling.
+
+        Trust flows downhill.  A direct call from trusted code makes its
+        target trusted; a direct call found inside a linear sweep's guesses
+        proves only that the sweep guessed twice.
+        """
+        wavefront: list[tuple[int, CodeProvenance]] = [
+            ((item[0] & ~1, item[1]) if isinstance(item, tuple) else (item & ~1, CodeProvenance.LINEAR_SWEEP))
+            for item in seeds
+        ]
+        # Most trusted first, so `visited` records the best reason, not the
+        # first one to be popped off a stack.
+        wavefront.sort(key=lambda item: item[1].rank)
+
+        seen_seeds: dict[int, CodeProvenance] = {}
+        pending: list[tuple[int, CodeProvenance]] = list(reversed(wavefront))
         while pending:
-            start = pending.pop()
-            if start in seen_seeds or start in self.visited:
+            start, provenance = pending.pop()
+            if start in self.visited and start not in self.functions:
                 continue
-            seen_seeds.add(start)
+            if start in seen_seeds and seen_seeds[start].rank <= provenance.rank:
+                continue
+            seen_seeds[start] = provenance
             if self.instruction_count >= self.max_instructions:
                 self.exhausted = True
                 break
-            function = self._walk(start)
+            function = self._walk(start, provenance)
             if function is None or not function.instructions:
                 continue
             self.functions[start] = function
+            inherited = provenance.demoted_to(CodeProvenance.DIRECT_CALL)
             for target in function.calls:
-                if target not in seen_seeds:
-                    pending.append(target)
+                if seen_seeds.get(target, CodeProvenance.DATA_DECODE).rank > inherited.rank:
+                    pending.append((target, inherited))
+            # Keep the queue in trust order: a newly found trusted callee
+            # should be walked before the sweep's leftover guesses.
+            pending.sort(key=lambda item: item[1].rank, reverse=True)
         return self.functions
 
-    def _walk(self, start: int) -> Optional[Function]:
+    def _walk(
+        self, start: int, provenance: CodeProvenance = CodeProvenance.LINEAR_SWEEP
+    ) -> Optional[Function]:
         """Linearly decode one function, following its internal branches."""
-        function = Function(start=start)
+        function = Function(start=start, provenance=provenance)
         worklist = [start]
         while worklist:
             address = worklist.pop()

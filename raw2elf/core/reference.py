@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Iterable, Iterator, Optional
 
+from .provenance import CodeProvenance
 from .util import fmt_value, hexs
 
 
@@ -91,6 +92,19 @@ class Reference:
     offset_value: Optional[int] = None
     #: Backend-supplied address-space opinion for ``value``.
     address_class: AddressClass = AddressClass.UNKNOWN
+    #: Why the instruction that produced this is believed to be code. An
+    #: address computed by bytes that merely decoded is not evidence that the
+    #: address exists, however well-formed the encoding.
+    code_provenance: CodeProvenance = CodeProvenance.LINEAR_SWEEP
+    #: Start address of the discovered function the instruction belongs to.
+    #: Accesses from several independently reached functions are much better
+    #: evidence than the same number of accesses from one block.
+    source_function: Optional[int] = None
+
+    @property
+    def trusted(self) -> bool:
+        """Whether this came from code something is known to reach."""
+        return self.code_provenance.trusted
 
     def runtime_value(self, runtime_base: int) -> int:
         return runtime_base + self.value if self.base_relative else self.value
@@ -113,6 +127,8 @@ class Reference:
             "base": hexs(self.base_value, 8),
             "offset": fmt_value(self.offset_value),
             "confidence": round(self.confidence, 3),
+            "code_provenance": self.code_provenance.value,
+            "source_function": hexs(self.source_function, 8),
         }
 
 
@@ -139,6 +155,17 @@ class ReferenceSet:
     def accesses(self) -> list[Reference]:
         """References where an instruction actually touched the address."""
         return [ref for ref in self._references if ref.access.touches_memory]
+
+    def trusted_accesses(self) -> list[Reference]:
+        """Accesses made by code something is known to reach."""
+        return [ref for ref in self.accesses() if ref.trusted]
+
+    def counts_by_provenance(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for ref in self._references:
+            key = ref.code_provenance.value
+            counts[key] = counts.get(key, 0) + 1
+        return counts
 
     def replace_all(self, references: Iterable[Reference]) -> None:
         self._references = list(references)

@@ -24,7 +24,9 @@ the package's parent directory on `sys.path`, so the suite runs from anywhere.
 | `test_cli.py` | Every output, override, query and failure path, plus module and script invocation. |
 | `test_interactive.py` | The questions asked when evidence runs out: what is asked, when, and that answers are used rather than merely recorded. |
 | `test_shell.py` | The interactive session: opening, settings and staleness, topics, `why`, writing, completion, and the boundary it must respect. |
-| `test_inference_is_conservative.py` | The ways inference can outrun its evidence — image tuples staying together, constants not becoming addresses, regions resting on real accesses, a supplied part number claiming nothing. |
+| `test_inference_is_conservative.py` | The ways inference can outrun its evidence — constants not becoming addresses, regions resting on real accesses, contradictions compounding, a candidate not being reported as an identification. |
+| `test_code_provenance.py` | The trust ladder: how it propagates, and that decoded data cannot establish memory however much of it there is. |
+| `test_image_placement.py` | The three coordinate systems, and that a program stored at a non-zero file offset loads and is emitted where it is linked. |
 | `test_end_to_end.py` | The graded metric matrix over every firmware in every format. |
 
 Tests that need external tools skip cleanly without them. The `objdump` check

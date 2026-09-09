@@ -44,16 +44,27 @@ def summary(reconstruction: Reconstruction, outputs: Sequence[str] = ()) -> str:
     )
     lines.append(_row("Architecture", target.display_name or reconstruction.backend.name))
     if candidate is not None:
-        carved = image.metadata.get("carved_from_offset", 0)
-        where = f"0x{carved + candidate.image_offset:06x}"
-        if carved:
+        # In the analyst's coordinates, not the carved image's: a report that
+        # restarts offsets at zero sends them to the wrong place in their file.
+        file_offset = context.file_offset_of(candidate.image_offset)
+        where = f"0x{file_offset:06x}"
+        if file_offset != candidate.image_offset:
             where += f" (0x{candidate.image_offset:06x} within the selected image)"
         lines.append(_row("Entry structure", f"{candidate.kind} at file offset {where}"))
     # Whatever else the architecture wants to report about its entry
     # structure: this code does not know, and does not need to.
     for label, value in reconstruction.backend.report_rows(context):
         lines.append(_row(label, value))
-    if base is not None:
+    placement = context.get("selected_placement")
+    if placement is not None and placement.runtime_base is not None:
+        # The address the *program* loads at. When the program starts partway
+        # into the input, that is not the address image offset zero would map
+        # to, and reporting the latter describes a program that is not there.
+        note = ""
+        if placement.image_offset:
+            note = f"  (program starts at file offset 0x{placement.file_offset:06x})"
+        lines.append(_row("Load base", f"0x{placement.runtime_base:08x}{note}"))
+    elif base is not None:
         lines.append(_row("Load base", f"0x{base:08x}"))
     if entry is None:
         lines.append(_row("Entry point", "not recovered"))
@@ -71,6 +82,13 @@ def summary(reconstruction: Reconstruction, outputs: Sequence[str] = ()) -> str:
         # would make the weak evidence look like the strong kind.
         ram_accessed = sum(1 for item in ram if item.access in (Access.READ, Access.WRITE))
         ram_literals = len(ram) - ram_accessed
+        # Of the accesses, how many were made by code something is known to
+        # reach. The rest come from bytes that decode as instructions, which
+        # is not the same as bytes that are executed.
+        ram_trusted = sum(
+            1 for item in ram if item.access in (Access.READ, Access.WRITE) and item.trusted
+        )
+        mmio_trusted = sum(1 for item in accesses if item.trusted)
         lines.append("")
         lines.append("Recovered:")
         lines.append(f"  Code references:   {counts.get(ReferenceKind.CODE.value, 0)}")
@@ -82,10 +100,19 @@ def summary(reconstruction: Reconstruction, outputs: Sequence[str] = ()) -> str:
             )
         lines.append(f"  Flash references:  {counts.get(ReferenceKind.FLASH_DATA.value, 0)}")
         lines.append(
-            f"  RAM references:    {ram_accessed} accessed"
+            f"  RAM references:    {ram_trusted} accessed"
             + (f", {ram_literals} as address literals" if ram_literals else "")
         )
-        lines.append(f"  MMIO accesses:     {len(accesses)}")
+        lines.append(f"  MMIO accesses:     {mmio_trusted}")
+        unreached = (ram_accessed - ram_trusted) + (len(accesses) - mmio_trusted)
+        if unreached:
+            # Counted, so nothing is hidden, but kept out of the totals above:
+            # these come from bytes that decode as instructions and that
+            # nothing is known to execute, so they establish nothing.
+            lines.append(
+                f"  Unreached code:    {unreached} further access(es), from bytes that decode "
+                "but are never reached"
+            )
 
     if memory_map is not None and len(memory_map):
         lines.append("")
@@ -121,15 +148,28 @@ def summary(reconstruction: Reconstruction, outputs: Sequence[str] = ()) -> str:
                 )
 
     lines.append("")
-    lines.append("Likely MCU:")
     if mcu is None:
+        lines.append("Likely MCU:")
         lines.append("  not identified")
-    else:
+    elif mcu.get("identified_device"):
         match = mcu["match"]
+        lines.append("Identified MCU:")
         lines.append(f"  {mcu['label']}  (confidence {match.confidence:.2f})")
-        candidates = context.get("mcu_candidates") or []
-        for other in candidates[1:3]:
+        for other in (context.get("mcu_candidates") or [])[1:3]:
             lines.append(f"    also matches {other.device.name} ({other.confidence:.2f})")
+    else:
+        # Nothing here rises to an identification. Say what was supplied,
+        # say what matched best, and do not let the two look like one answer.
+        best = mcu["best_candidate"]
+        lines.append("MCU:")
+        lines.append("  identified:      no")
+        if mcu.get("supplied_hint"):
+            lines.append(f"  supplied hint:   {mcu['supplied_hint']}")
+        lines.append(
+            f"  best candidate:  {best['device']}  (confidence {best['confidence']:.2f})"
+        )
+        for other in (context.get("mcu_candidates") or [])[1:3]:
+            lines.append(f"                   {other.device.name} ({other.confidence:.2f})")
 
     lines.append("")
     lines.append("Confidence:")
@@ -270,7 +310,8 @@ def _candidate_listing(error, context, subject: str) -> list[str]:
         lines = ["Candidate entry structures:"]
         for index, candidate in enumerate(candidates[:5], start=1):
             lines.append(
-                f"  {index}. {candidate.kind} at file offset 0x{candidate.image_offset:06x}"
+                f"  {index}. {candidate.kind} at file offset "
+                f"0x{context.file_offset_of(candidate.image_offset):06x}"
                 f"    confidence {candidate.confidence:.2f}"
             )
             for item in candidate.evidence[:4]:

@@ -49,6 +49,8 @@ MAX_SHORTLIST = 64
 #: Fewer distinct peripheral addresses than this cannot identify a part.
 MIN_ACCESSES = 4
 #: Scores within this margin are treated as indistinguishable.
+#: Below this, the evidence names a candidate rather than identifying a part.
+IDENTIFIED_CONFIDENCE = 0.5
 TIE_MARGIN = 0.02
 #: A family name shorter than this is not informative enough to report.
 MIN_FAMILY_PREFIX = 4
@@ -841,15 +843,44 @@ class SvdMatcher(AnalysisPass):
                 )
             )
 
+        # A device name is only reported as identified when the recovered
+        # accesses actually identify it. Below that bar the best candidate is
+        # still published -- it is the most useful thing there is to say --
+        # but as a candidate, under its own key, not as the answer.
+        identified = (
+            selected.confidence >= IDENTIFIED_CONFIDENCE
+            and distinct >= MIN_ACCESSES
+            and not context.options.mcu
+        )
         context.provide(
             "mcu",
             {
                 "label": label,
-                "exact": exact,
+                "exact": exact and identified,
                 "match": selected,
                 "arbitrary_representative": not exact,
+                "supplied_hint": context.options.mcu,
+                "identified_device": selected.device.name if identified else None,
+                "identification_confidence": round(selected.confidence, 4),
+                "best_candidate": {
+                    "device": selected.device.name,
+                    "vendor": selected.device.vendor,
+                    "confidence": round(selected.confidence, 4),
+                },
             },
         )
+        if context.options.mcu and selected.confidence < IDENTIFIED_CONFIDENCE:
+            context.warn(
+                f"the supplied part {context.options.mcu} is only weakly supported by the "
+                f"firmware: {selected.matched_bases} of {selected.total_bases} recovered "
+                f"peripheral base addresses and {selected.matched_addresses} of "
+                f"{selected.total_addresses} register addresses match it"
+            )
+        elif not identified and not context.options.mcu:
+            context.warn(
+                f"no part was identified; {selected.device.name} is the best of "
+                f"{len(matches)} candidates at {selected.confidence:.2f} confidence"
+            )
         # Published verbatim from the SVD.  Turning "CM4" into a core name is
         # architecture-specific knowledge, so the backend does that.
         context.provide("svd_cpu_name", selected.device.cpu or None)
@@ -875,7 +906,11 @@ class SvdMatcher(AnalysisPass):
         )
         context.provide("_svd_database", database)
         context.provide("svd_annotations", self._annotations(context, selected))
-        context.log(f"mcu: {label} confidence {selected.confidence:.2f}", level=1)
+        context.log(
+            f"mcu: {label} confidence {selected.confidence:.2f}"
+            + ("" if identified else " (candidate only, not identified)"),
+            level=1,
+        )
 
     def _annotations(self, context: AnalysisContext, match: Match) -> dict[str, Any]:
         """Peripheral, register and interrupt names for the chosen device."""

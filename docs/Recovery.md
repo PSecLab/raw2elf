@@ -88,6 +88,27 @@ applied as a hard rejection while tables are being found, before anything is
 scored — an unaddressable offset never becomes a candidate at all, however
 convincing its contents.
 
+**Contradictions compound.** A structure that is at once mis-stacked,
+mis-pointed and wider than the image it sits in is not a slightly worse vector
+table than one with a single oddity — it is a different kind of thing. Summing
+the penalties lets a pile of supporting coincidences outvote them, which is how
+data that resembles a table reaches four-fifths confidence. So independent
+serious contradictions are penalized super-linearly: two cost a little, three
+cost a great deal.
+
+**A stack pointer no part could have is one of those contradictions.** SRAM
+banks sit at strongly aligned boundaries within the SRAM window, and no
+Cortex-M part carries anything like 16 MiB of internal SRAM. A word that lands
+in the window 49 MiB above the nearest bank boundary is a constant, not a stack
+pointer. Alignment is deliberately *not* used for this: real initial stack
+pointers are often only four- or eight-byte aligned (`0x200035cc`,
+`0x200019f8`), so an alignment test would reject real firmware.
+
+Together these take a synthetic false positive — plausible stack pointer,
+Thumb reset vector, five named vectors, clustered handlers — from 0.92 to 0.11.
+It is still reported, as a low-confidence vector-like structure, rather than
+discarded silently.
+
 On a real dump where floating-point tables and string data had been scoring as
 high as 0.92, these leave only the genuine images standing.
 
@@ -223,6 +244,59 @@ is visible without reading the manifest:
   RAM references:    13 accessed, 31 as address literals
 ```
 
+## A decoded instruction is not executed code
+
+Almost any byte sequence decodes as something. A page of compressed data
+decodes into a run of well-formed Thumb instructions, several of which are
+loads and stores, and the effective addresses those compute look exactly like
+the addresses real loads and stores compute. An analysis that treats every
+decoded instruction alike will report memory regions built out of a
+compression dictionary and a string table.
+
+    valid instruction encoding  ≠  known executable code
+
+So every discovered instruction records *why* it is believed to be code, and
+that reason travels with each reference it produces. The reasons form a ladder:
+
+| Provenance | Why these bytes are code |
+| --- | --- |
+| `ENTRY_POINT` | Reachable from the recovered entry point. |
+| `DECLARED_HANDLER` | Reachable from another entry the backend declared — on Cortex-M, a vector-table handler. The hardware enters these directly. |
+| `DIRECT_CALL` | Called by a direct PC-relative call from code that is itself trusted. The call is part of the caller's encoding. |
+| `VALIDATED_INDIRECT_CALL` | Reached through an indirect call whose target was recovered and checked. |
+| `SPECULATIVE_FUNCTION` | Looks like a function; nothing was shown to reach it. |
+| `LINEAR_SWEEP` | Found only by decoding forward from an arbitrary point. |
+| `DATA_DECODE` | Decoded from bytes there is positive reason to think are data. |
+
+The first four are **trusted**: something itself believed to be code transfers
+control here. The rest are hypotheses about bytes.
+
+Two rules govern how it propagates:
+
+**Trust flows downhill only.** A direct call from reset-reachable code makes
+its target trusted. A direct call found *inside* a linear sweep's guesses
+proves only that the sweep guessed twice, so the callee inherits the weaker of
+the caller's provenance and `DIRECT_CALL` — never better than its caller.
+
+**The best reason wins, and it is found first.** Seeds are taken in order of
+how much they are trusted, so a function the reset path reaches is recorded as
+reset-reachable even when a sweep also happened to guess it. No re-labelling
+pass is needed.
+
+The console reports what this excluded, so nothing disappears silently:
+
+```
+Recovered:
+  Code references:   92
+  Constants:         2994   (loaded, never used as an address)
+  RAM references:    10 accessed, 1123 as address literals
+  MMIO accesses:     28
+  Unreached code:    3105 further access(es), from bytes that decode but are never reached
+```
+
+Those 3105 accesses are real decodings of real bytes. They are not evidence
+that the addresses they compute exist.
+
 ## Memory regions
 
 Regions are clustered **only** from addresses with real provenance:
@@ -255,16 +329,45 @@ writing, is a memory region. The weighing is:
 | Evidence | Contribution |
 | --- | --- |
 | A startup boundary or the reset stack pointer falls in the range | strongest |
-| Addresses in the range are written | strong |
-| Distinct instructions reach the range | accumulates, capped |
+| Addresses in the range are written **by code that is reached** | strong |
+| Distinct instructions **in reached code** touch the range | accumulates, capped |
 | Distinct addresses within the range | accumulates, capped |
+| Several **independently reached functions** touch the range | strong |
 | The range agrees with where a named part maps memory | strong |
+| Accesses from bytes nothing is known to execute | capped, and the cap is low |
+| The window needs an external controller the firmware never configured | counts against |
+
+Two of those rows carry most of the weight.
+
+**Independently reached functions corroborate; one busy block does not.**
+Twenty stores in a row are one piece of code's opinion about where memory is.
+Two functions reached by different paths agreeing that memory is at an address
+is a corroboration, and is scored as one.
+
+**Untrusted evidence is capped, not summed.** Accesses from instructions that
+merely decoded contribute a small amount that saturates: a thousand of them
+are worth no more than a handful, and cannot on their own carry a region past
+the established threshold. Weak evidence repeated is still weak evidence, and
+a linear sweep over a compressed asset produces a great deal of it.
 
 Below a floor, a cluster is not reported at all. Above it but below the
 established threshold, the region is reported and marked **speculative**:
 visible in the console and in the manifest under `speculative_regions`, so
-nothing is silently discarded, but not treated as recovered memory. Only
-established regions are described as part of the recovered memory map.
+nothing is silently discarded, but not treated as recovered memory.
+
+A region is **established** only when three things hold at once:
+
+- reached code made the accesses (or a startup boundary anchors the range),
+- there is enough of that evidence, and
+- the target plausibly has memory there.
+
+Any one of them missing leaves the region reported but speculative. The third
+is the backend's judgement, not the core's: the neutral code asks the backend
+how plausible memory is at an address and never knows the answer itself. On
+Cortex-M, on-chip SRAM and the peripheral windows score full marks, while the
+external RAM and external device windows — which need a memory controller
+configured before they respond at all, and which is where stray constants most
+often land — are held to a much higher bar.
 
 Neither kind is inserted into the ELF. RAM and MMIO regions are analysis
 output; the ELF's `PT_LOAD` segments come from the image bytes and from the
@@ -388,6 +491,41 @@ A match adds peripheral base symbols, renames device interrupt handlers from
 `IRQ37_Handler` to `USART1_IRQHandler`, and with `--svd-symbols registers` adds
 register symbols such as `RCC_CFGR`.
 
+### A candidate is not an identification
+
+A device name is reported as identified only when the recovered accesses
+identify it. Below that bar the best candidate is still published — it is the
+most useful thing there is to say — but under its own key, as a candidate:
+
+```
+MCU:
+  identified:      no
+  supplied hint:   STM32L0
+  best candidate:  STM32L0x1  (confidence 0.43)
+                   STM32L0x2 (0.43)
+```
+
+and in the manifest:
+
+```json
+"mcu": {
+  "supplied_family_hint": "STM32L0",
+  "identified_device": null,
+  "identification_confidence": 0.435,
+  "best_candidate": {"device": "STM32L0x1", "vendor": "STMicro", "confidence": 0.435}
+}
+```
+
+`identified_device` is the key to branch on, and it is `null` whenever the
+evidence does not reach an identification. A weak match also raises a warning
+naming the shortfall, so it is visible without reading the numbers:
+
+```
+Warnings:
+  - the supplied part STM32L0 is only weakly supported by the firmware: 3 of 6
+    recovered peripheral base addresses and 8 of 20 register addresses match it
+```
+
 ### A supplied part number is a hint, not an identification
 
 `--mcu NAME` skips ranking, and what it produces is labelled accordingly:
@@ -439,13 +577,47 @@ file offset it came from is kept for reporting.
 
 ### Every recovered fact describes one image
 
-Base, entry, entry structure, initial stack pointer and extent form a tuple,
-and a tuple is only meaningful about a single image. Each candidate image
-therefore carries its own complete tuple — `runtime_base`, `entry`,
-`entry_structure` and `initial_stack_pointer` — rather than sharing fields with
-its neighbours. Mixing a base recovered from one image with an entry recovered
-from another produces a result in which every individual number looks
-reasonable and the combination is nonsense.
+Base, entry, entry structure, initial stack pointer and extent only mean
+anything together, so they are not passed around separately. One type,
+`ImagePlacement`, holds all of them, and every later stage — entry selection,
+memory mapping, symbol emission, ELF construction — works from one selected
+placement. Mixing a base recovered from one image with an entry recovered from
+another produces a result in which every individual number looks reasonable and
+the combination describes no image that exists; the type is what makes that
+assembly happen in one place instead of implicitly in five.
+
+It also holds all three coordinate systems at once, because confusing them is
+the other half of the same failure:
+
+| Coordinate | Meaning |
+| --- | --- |
+| `file_offset` | Where the bytes are in the input the analyst supplied. Survives carving. |
+| `image_offset` | Where the bytes are in the image under analysis. Restarts at zero when an image is carved out of a dump. |
+| `runtime_base` | Where the bytes load on the target. |
+
+A carved image restarts its offsets at zero, so a report that echoed one back
+unchanged would send the analyst to the wrong place in their own file. Every
+reported file offset is converted through the placement:
+
+```
+Entry structure:    vector_table at file offset 0x020000 (0x000000 within the selected image)
+Load base:          0x08020000
+```
+
+An image's `runtime_base` is where *that image* loads, not where the dump
+around it loads. For a bootloader at file offset 0 and an application at
+0x020000 in a dump linked at 0x08000000, the two placements are:
+
+```json
+{"file_offset": "0x000000", "runtime_base": "0x08000000", "entry_structure": "0x08000000",
+ "entry": "0x080002e0", "initial_stack_pointer": "0x20000600"}
+{"file_offset": "0x020000", "runtime_base": "0x08020000", "entry_structure": "0x08020000",
+ "entry": "0x08020de8", "initial_stack_pointer": "0x30000600"}
+```
+
+A placement also knows when its own parts disagree — an entry outside the
+image's own runtime extent means the numbers were assembled from more than one
+image — and that inconsistency is reported as a warning rather than emitted.
 
 Without `--image`, the dump is reconstructed as one span of flash. Base
 recovery then **anchors on the image being converted**: the base is the one
@@ -467,6 +639,31 @@ scattered through an image, but the nearest one is close, because code starts
 right after the vector table. A base that leaves even the nearest handler a
 long way past its own table has usually put that table where some other image's
 table belongs, and is penalized heavily.
+
+### The program is not always the whole input
+
+A dump may open with erased flash, a configuration block or a second program.
+Those bytes are not part of the program being reconstructed, and treating them
+as its leading bytes places it at an address it does not occupy.
+
+The concrete failure: one image stored at file offset 0x020000 and linked to
+run at 0x08000000. Reading the dump as a single span makes its load address
+`0x07fe0000` — the address that would put file offset zero in the right place
+if the erased flash in front of the program were part of it. Every check
+passes; no Cortex-M part has flash there.
+
+So the placement covers the extent of the image the entry structure heads, and
+the ELF's `PT_LOAD` segments are clipped to it:
+
+```
+Entry structure:    vector_table at file offset 0x020000
+Load base:          0x08000000  (program starts at file offset 0x020000)
+Memory regions:
+  flash  0x08000000-0x08001187     4.4K  flash
+```
+
+Where the program *is* the whole input — the ordinary case, and the two-image
+dump above without `--image` — nothing changes.
 
 ## Padding and holes
 

@@ -256,6 +256,20 @@ class ArchitectureBackend(ABC):
         """What the architecture's address map reserves ``address`` for."""
         return AddressClass.UNKNOWN
 
+    def region_plausibility(self, address: int) -> float:
+        """How plausible it is that this target has memory at ``address``.
+
+        Distinct from :meth:`classify_address`, which says what the address
+        map *reserves* a range for.  A range can be reserved for memory that
+        a given part does not fit: an address in a window that needs an
+        external controller configured before it responds is far less likely
+        to be real memory than one in on-chip SRAM, and evidence for a region
+        there should have to be correspondingly better.
+
+        Returns a weight in ``[0, 1]``.  The default abstains.
+        """
+        return 0.5
+
     def normalize_code_pointer(self, value: int) -> int:
         """Strip any instruction-mode encoding from a code pointer."""
         return value

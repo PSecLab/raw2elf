@@ -62,7 +62,8 @@ bumped only for an incompatible layout change.
 | `raw2elf` | Manifest version and tool version. |
 | `input` | Source path, detected format, the full detection ranking, byte counts, per-segment addresses, and any parser notes. |
 | `target` | Architecture, subarchitecture, instruction mode, endianness, pointer width, ELF machine number and flags — kept separate rather than collapsed into one string. |
-| `entry_structure` | The chosen entry structure: kind, image offset, runtime address, confidence. |
+| `entry_structure` | The chosen entry structure: kind, file offset, image offset, runtime address, confidence. |
+| `placement` | The one tuple every later stage worked from — `file_offset`, `image_offset`, `image_size`, `runtime_base`, `entry_structure`, `entry`, `initial_stack_pointer`. Read this rather than reassembling the pieces. |
 | `architecture_candidates` | Every backend's probe confidence and details. |
 | `base_candidates` | Ranked load addresses, each with score, confidence, origin, and its evidence. |
 | `images` | Candidate firmware images found in the input, each with its own complete tuple: `runtime_base`, `entry`, `entry_structure` and `initial_stack_pointer`. |
@@ -77,7 +78,7 @@ bumped only for an incompatible layout change.
 | `data_initialization` | The `.data`-style copies, extracted from `startup` for convenience. |
 | `bss` | The `.bss`-style cleared ranges, likewise. |
 | `interrupts` | The full handler table: index, IRQ number, name, handler address, and whether the vector is architectural. |
-| `mcu`, `mcu_candidates` | The chosen MCU and the ranked alternatives with their scores. A part supplied with `--mcu` appears as `NAME (supplied)` with `exact` false — see [A supplied part number is a hint](Recovery.md#a-supplied-part-number-is-a-hint-not-an-identification). |
+| `mcu`, `mcu_candidates` | `identified_device` (null unless the firmware identified it), `identification_confidence`, `supplied_family_hint`, and `best_candidate` — plus the ranked alternatives. See [A candidate is not an identification](Recovery.md#a-candidate-is-not-an-identification). |
 | `peripherals`, `peripheral_registers` | Peripheral and register annotations from a confident SVD match. |
 | `symbols` | Every emitted symbol with its value, size, kind, and the analysis that produced it. |
 | `evidence` | The full evidence log for the run. |
@@ -156,6 +157,13 @@ together is the quickest check on how much the run is claiming:
 }
 ```
 
+Every reference also carries `code_provenance` and `source_function`, saying
+why the instruction that produced it is believed to be code and which
+discovered function it belongs to. `by_provenance` totals the same references
+that way. Only `ENTRY_POINT`, `DECLARED_HANDLER`, `DIRECT_CALL` and
+`VALIDATED_INDIRECT_CALL` are trusted; see
+[A decoded instruction is not executed code](Recovery.md#a-decoded-instruction-is-not-executed-code).
+
 `CONSTANT` with `ADDRESS_ONLY` is a value some instruction loaded and nothing
 dereferenced. That is most of a literal pool, and it stays a constant however
 much it resembles an address. `READ`, `WRITE` and `EXECUTE` mark the references
@@ -186,7 +194,9 @@ instruction, so nothing is lost by not calling them addresses.
 
 `speculative` is the field to branch on. A consumer building a memory map
 should use `regions`; `speculative_regions` is for a human deciding whether to
-look further.
+look further. A region reaches `regions` only if reached code made the
+accesses, there is enough such evidence, and the target plausibly has memory
+at that address.
 
 ### Startup state
 

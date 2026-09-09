@@ -146,6 +146,17 @@ Memory regions:
   ram    0x24000000-0x240000ff      256  ram2      speculative (0.41)
 ```
 
+**Accesses from bytes nothing executes are counted separately.** A dump with a
+string table and a compressed asset in it produces an extra line:
+
+```
+  Unreached code:    3105 further access(es), from bytes that decode but are never reached
+```
+
+Those decodings are real; they are not evidence that the addresses they compute
+exist, and they establish no memory regions. See
+[A decoded instruction is not executed code](Recovery.md#a-decoded-instruction-is-not-executed-code).
+
 **The MCU is two families, not a part number.** AT32F4 and STM32F4 are
 register-compatible, so from these accesses the part genuinely cannot be
 narrowed further, and saying otherwise would be false precision.

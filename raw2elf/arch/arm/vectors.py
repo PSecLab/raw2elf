@@ -69,6 +69,26 @@ VENDOR_SRAM = (0x10000000, 0x20000000)
 #: Share of random words that pass a one-bit test, used to discount evidence
 #: down to what exceeds chance.
 CHANCE = 0.5
+
+#: SRAM banks are placed at strongly aligned boundaries within the SRAM
+#: window -- 0x20000000, 0x24000000, 0x30000000, 0x38000000 and the like --
+#: and no Cortex-M part carries anywhere near this much internal SRAM.  A
+#: stack pointer far above every such boundary is not a stack pointer.
+SRAM_BANK_ALIGNMENT = 0x04000000
+MAX_SRAM_SPAN = 0x01000000
+
+#: How much each additional independent contradiction multiplies the doubt.
+#: One oddity in an otherwise convincing table is an oddity; three at once
+#: mean it is not a table, and adding the penalties one at a time does not
+#: express that.
+COMPOUNDING = 1.6
+#: Evidence lighter than this is a nuance rather than a contradiction.
+SERIOUS_CONTRADICTION = 1.0
+
+
+def stack_pointer_span(value: int) -> int:
+    """How far ``value`` sits above the nearest plausible SRAM bank origin."""
+    return value - (value & ~(SRAM_BANK_ALIGNMENT - 1))
 #: Granularities a linker plausibly uses for a firmware image's base.
 BASE_ALIGNMENTS: tuple[int, ...] = (
     0x1000000, 0x100000, 0x40000, 0x20000, 0x10000, 0x8000,
@@ -89,6 +109,8 @@ class VectorTable:
     score: float = 0.0
     confidence: float = 0.0
     evidence: list[Evidence] = field(default_factory=list)
+    #: The subset of ``evidence`` a real table would have to explain away.
+    contradictions: list[Evidence] = field(default_factory=list)
 
     @property
     def reset_address(self) -> int:
@@ -280,19 +302,39 @@ def score_table(table: VectorTable, remaining_bytes: int, classify) -> None:
     source = "cortex-m/vectors"
 
     aligned = table.initial_sp % 8 == 0
-    evidence.append(
-        Evidence(
-            kind="initial_sp",
-            source=source,
-            explanation=(
-                f"word 0 {table.initial_sp:#010x} is a plausible initial MSP"
-                + (", eight-byte aligned as AAPCS wants" if aligned else ", word aligned only")
-            ),
-            value=table.initial_sp,
-            weight=2.0 if aligned else 1.4,
+    span = stack_pointer_span(table.initial_sp)
+    if span > MAX_SRAM_SPAN:
+        # In the SRAM window, but further above any bank boundary than any
+        # Cortex-M part has SRAM. The word is a constant that landed in the
+        # window, not a stack pointer.
+        score -= 3.0
+        evidence.append(
+            Evidence(
+                kind="initial_sp",
+                source=source,
+                explanation=(
+                    f"word 0 {table.initial_sp:#010x} sits {span / (1 << 20):.0f} MiB above the "
+                    "nearest SRAM bank boundary, further than any Cortex-M part has SRAM"
+                ),
+                value=table.initial_sp,
+                weight=3.0,
+                supports=False,
+            )
         )
-    )
-    score += 2.0 if aligned else 1.4
+    else:
+        evidence.append(
+            Evidence(
+                kind="initial_sp",
+                source=source,
+                explanation=(
+                    f"word 0 {table.initial_sp:#010x} is a plausible initial MSP"
+                    + (", eight-byte aligned as AAPCS wants" if aligned else ", word aligned only")
+                ),
+                value=table.initial_sp,
+                weight=2.0 if aligned else 1.4,
+            )
+        )
+        score += 2.0 if aligned else 1.4
 
     evidence.append(
         Evidence(
@@ -528,9 +570,38 @@ def score_table(table: VectorTable, remaining_bytes: int, classify) -> None:
             )
         )
 
+    # Independent contradictions are not additive. A structure that is at
+    # once mis-stacked, mis-pointed and wider than the image it sits in is
+    # not a slightly worse vector table than one with a single oddity; it is
+    # a different kind of thing. Summing the penalties lets a pile of
+    # supporting coincidences outvote them, which is how data that resembles
+    # a table reaches four-fifths confidence.
+    contradictions = [
+        item
+        for item in evidence
+        if not item.supports and item.weight >= SERIOUS_CONTRADICTION
+    ]
+    if len(contradictions) > 1:
+        penalty = COMPOUNDING * (len(contradictions) - 1) ** 2
+        score -= penalty
+        evidence.append(
+            Evidence(
+                kind="compound_contradiction",
+                source=source,
+                explanation=(
+                    f"{len(contradictions)} independent contradictions, each of which a real "
+                    "vector table would have to explain away"
+                ),
+                value=len(contradictions),
+                weight=penalty,
+                supports=False,
+            )
+        )
+
     table.score = score
     table.confidence = logistic(score, midpoint=3.5, steepness=0.75)
     table.evidence = evidence
+    table.contradictions = contradictions
 
 
 def find_tables(

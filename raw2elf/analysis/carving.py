@@ -260,21 +260,32 @@ class ImageDiscovery(AnalysisPass):
                 image.size,
             )
             end = self._trim(offset, following, padding)
-            # Each image's base comes from its own entry structure, so every
-            # field below describes the same image.
+            size = max(end - offset, 0)
+
+            # An image's runtime base is where *that image* loads, not where
+            # the dump around it loads. The backend's seeds are expressed as
+            # bases for the whole input, so the image's own base is the seed
+            # shifted by where the image sits inside it. Reporting the dump's
+            # base against an image at a non-zero offset is what makes a
+            # tuple look plausible while describing no image that exists.
             seeds = candidate.details.get("base_seeds") or ()
-            own_base = seeds[0][0] if seeds else None
+            dump_base = seeds[0][0] if seeds else None
+            own_base = None if dump_base is None else dump_base + offset
+
+            placement = context.placement_for(
+                image_offset=offset,
+                image_size=size,
+                runtime_base=own_base,
+                entry_structure=own_base,
+                entry=candidate.entry_value,
+                initial_stack_pointer=candidate.details.get("initial_sp"),
+                confidence=candidate.confidence,
+            )
             hypotheses.append(
                 ImageHypothesis(
                     architecture=context.backend.name,
-                    image_offset=offset,
-                    image_size=max(end - offset, 0),
-                    runtime_base=own_base,
-                    entry=candidate.entry_value,
-                    entry_structure=None if own_base is None else own_base + offset,
-                    initial_stack_pointer=candidate.details.get("initial_sp"),
+                    placement=placement,
                     score=candidate.details.get("score", 0.0),
-                    confidence=candidate.confidence,
                     evidence=list(candidate.evidence),
                     details={"entry_kind": candidate.kind},
                 )

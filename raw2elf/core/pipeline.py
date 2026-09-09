@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 from .evidence import Evidence, EvidenceLog
 from .image import FirmwareImage
 from .options import OptionError, Options
+from .placement import ImagePlacement
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime dependency
     from ..arch.base import ArchitectureBackend
@@ -87,6 +88,34 @@ class AnalysisContext:
     def runtime_base(self) -> int:
         """The chosen load address, or zero while it is still unknown."""
         return self.get("runtime_base", 0) or 0
+
+    def file_offset_of(self, image_offset: int) -> int:
+        """Where an image offset was in the input the analyst supplied.
+
+        A carved image restarts its offsets at zero, so reporting one back
+        unchanged would tell the analyst to look in the wrong place in their
+        own file.  Segments keep the provenance; this converts with it.
+        """
+        segment = self.image.segment_at_offset(image_offset)
+        if segment is not None and segment.file_offset is not None:
+            return segment.file_offset + (image_offset - segment.image_offset)
+        return image_offset + int(self.image.metadata.get("carved_from_offset", 0) or 0)
+
+    def placement_for(
+        self,
+        image_offset: int,
+        image_size: int,
+        runtime_base: Optional[int] = None,
+        **facts: Any,
+    ) -> "ImagePlacement":
+        """Assemble a placement for one image in this analysis."""
+        return ImagePlacement(
+            file_offset=self.file_offset_of(image_offset),
+            image_offset=image_offset,
+            image_size=image_size,
+            runtime_base=runtime_base,
+            **facts,
+        )
 
     def offset_to_address(self, offset: int) -> Optional[int]:
         declared = self.image.declared_address_for(offset)

@@ -27,6 +27,7 @@ from typing import Callable, Optional
 
 from capstone import arm as csarm
 
+from ...core.provenance import CodeProvenance
 from ...core.reference import Access, AddressClass, Reference, ReferenceKind
 from .decoder import Decoder, branch_target, is_call, is_literal_load, literal_address, pc_relative_address
 from .flow import CodeGraph, ThumbSemantics
@@ -197,13 +198,15 @@ class AccessRecovery:
     first_states: dict[int, dict[int, object]] = field(default_factory=dict)
     #: Per function, reverse control-flow edges.
     predecessors: dict[int, dict[int, set]] = field(default_factory=dict)
+    #: Indirect-call targets recovered from trusted code, worth discovering.
+    validated_targets: list[tuple[int, CodeProvenance]] = field(default_factory=list)
 
 
 def recover_accesses(
     context,
     decoder: Decoder,
     classify: Callable[[int], AddressClass],
-    seeds: list[int],
+    seeds: list[tuple[int, CodeProvenance]],
     max_instructions: int = 400_000,
 ) -> AccessRecovery:
     """Discover code from ``seeds`` and recover its memory references."""
@@ -231,9 +234,11 @@ def recover_accesses(
                 continue
             working = state.copy()
             semantics.apply(instruction, working, sink=events)
-            _indirect_branch(instruction, state, recovery, classify)
+            _indirect_branch(instruction, state, recovery, classify, function, graph)
         for event in events:
-            recovery.references.append(_from_event(event, classify))
+            recovery.references.append(
+                _from_event(event, classify, function.provenance, start)
+            )
         if function.order:
             last = function.order[-1]
             recovery.code_regions.append(
@@ -242,7 +247,12 @@ def recover_accesses(
     return recovery
 
 
-def _from_event(event, classify: Callable[[int], AddressClass]) -> Reference:
+def _from_event(
+    event,
+    classify: Callable[[int], AddressClass],
+    provenance: CodeProvenance = CodeProvenance.LINEAR_SWEEP,
+    function_start: Optional[int] = None,
+) -> Reference:
     address_class = classify(event.address)
     if event.derivation == "pc-relative literal":
         # Loading a value says nothing about what it is. Classification waits
@@ -269,6 +279,8 @@ def _from_event(event, classify: Callable[[int], AddressClass]) -> Reference:
         base_value=event.base_value,
         offset_value=event.displacement,
         address_class=address_class,
+        code_provenance=provenance,
+        source_function=function_start,
     )
 
 
@@ -282,8 +294,15 @@ def _kind_for(address_class: AddressClass) -> ReferenceKind:
     return ReferenceKind.UNKNOWN
 
 
-def _indirect_branch(instruction, state, recovery: AccessRecovery, classify) -> None:
-    """Record a resolvable ``BX``/``BLX`` destination as a code reference."""
+def _indirect_branch(
+    instruction, state, recovery: AccessRecovery, classify, function=None, graph=None
+) -> None:
+    """Record a resolvable ``BX``/``BLX`` destination as a code reference.
+
+    A recovered target is only as good as the code that computes it, so the
+    branch inherits its function's provenance, floored at the rung for an
+    indirect call that was actually resolved.
+    """
     if instruction.id not in (csarm.ARM_INS_BX, csarm.ARM_INS_BLX):
         return
     operands = instruction.operands
@@ -296,6 +315,8 @@ def _indirect_branch(instruction, state, recovery: AccessRecovery, classify) -> 
     target = value.constant()
     if target is None or target in _NOISE:
         return
+    caller = function.provenance if function is not None else CodeProvenance.LINEAR_SWEEP
+    provenance = caller.demoted_to(CodeProvenance.VALIDATED_INDIRECT_CALL)
     recovery.references.append(
         Reference(
             value=target,
@@ -309,5 +330,10 @@ def _indirect_branch(instruction, state, recovery: AccessRecovery, classify) -> 
             base_relative=False,
             useful_for_base=_address_class_useful_for_base(classify(target)),
             address_class=classify(target),
+            code_provenance=provenance,
+            source_function=None if function is None else function.start,
         )
     )
+    # A validated indirect target is code, and the code it calls is code.
+    if graph is not None and provenance.trusted:
+        recovery.validated_targets.append((target & ~1, provenance))

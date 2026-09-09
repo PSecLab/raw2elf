@@ -17,6 +17,7 @@ from ...core.evidence import Evidence
 from ...core.hypothesis import EntryCandidate
 from ...core.image import FirmwareImage
 from ...core.memory import MemoryRegion, RegionKind, StartupState
+from ...core.provenance import CodeProvenance
 from ...core.reference import Access, AddressClass, Reference, ReferenceKind
 from ...core.util import logistic
 from ..base import (
@@ -49,6 +50,23 @@ _ADDRESS_MAP: tuple[tuple[int, int, AddressClass], ...] = (
     (0xA0000000, 0xE0000000, AddressClass.MMIO),
     (0xE0000000, 0xE0100000, AddressClass.SYSTEM),
     (0xE0100000, 0x100000000, AddressClass.RESERVED),
+)
+
+#: How likely each window is to be memory that responds without setup, and so
+#: how good the evidence for a region there has to be.  On-chip SRAM and the
+#: peripheral space are what an ordinary firmware touches.  The external RAM
+#: and external device windows need a memory controller configured first, and
+#: are also where a stray constant most often lands, so a region there is
+#: believed only on much stronger evidence.
+_REGION_PLAUSIBILITY: tuple[tuple[int, int, float], ...] = (
+    (0x00000000, 0x10000000, 0.6),    # code space; some parts alias SRAM here
+    (0x10000000, 0x20000000, 0.9),    # vendor tightly-coupled SRAM
+    (0x20000000, 0x40000000, 1.0),    # on-chip SRAM
+    (0x40000000, 0x60000000, 1.0),    # on-chip peripherals
+    (0x60000000, 0xA0000000, 0.15),   # external RAM, needs a controller
+    (0xA0000000, 0xE0000000, 0.15),   # external device, likewise
+    (0xE0000000, 0xE0100000, 1.0),    # the private peripheral block
+    (0xE0100000, 0x100000000, 0.0),   # reserved by the architecture
 )
 
 #: Ranges the image itself can plausibly be linked into.
@@ -126,6 +144,13 @@ class CortexMBackend(ArchitectureBackend):
             if low <= address < high:
                 return kind
         return AddressClass.UNKNOWN
+
+    def region_plausibility(self, address: int) -> float:
+        address &= 0xFFFFFFFF
+        for low, high, weight in _REGION_PLAUSIBILITY:
+            if low <= address < high:
+                return weight
+        return 0.0
 
     def normalize_code_pointer(self, value: int) -> int:
         """Drop the Thumb interworking bit."""
@@ -863,6 +888,10 @@ class CortexMBackend(ArchitectureBackend):
                         confidence=0.9,
                         source_text=f"vector[{slot}]",
                         address_class=self.classify_address(value),
+                        # The hardware enters a vector's handler directly, so
+                        # a slot in a table is the strongest declaration
+                        # available that its target is code.
+                        code_provenance=CodeProvenance.DECLARED_HANDLER,
                     )
                 )
         return references
@@ -875,16 +904,28 @@ class CortexMBackend(ArchitectureBackend):
         def build() -> arm_references.AccessRecovery:
             base = context.runtime_base
             sweep = self._sweep(context)
-            seeds: list[int] = []
+            # Each seed carries why it is believed to be code. The reset
+            # vector and the exception handlers are entered by the hardware;
+            # the sweep's call targets are a guess about bytes, and anything
+            # reached only through them stays a guess.
+            seeds: list[tuple[int, CodeProvenance]] = []
             entry = context.get("entry")
             if entry is not None:
-                seeds.append(self.normalize_code_pointer(entry))
+                seeds.append(
+                    (self.normalize_code_pointer(entry), CodeProvenance.ENTRY_POINT)
+                )
             selected = context.get("selected_entry_candidate")
             if selected is not None:
                 table = selected.details.get("table")
                 if table is not None:
-                    seeds.extend(table.handler_addresses)
-            seeds.extend(base + offset for offset in sweep.call_locations)
+                    seeds.extend(
+                        (address, CodeProvenance.DECLARED_HANDLER)
+                        for address in table.handler_addresses
+                    )
+            seeds.extend(
+                (base + offset, CodeProvenance.LINEAR_SWEEP)
+                for offset in sweep.call_locations
+            )
             return arm_references.recover_accesses(
                 context,
                 self.decoder,

@@ -89,12 +89,20 @@ def build(reconstruction: Reconstruction) -> dict[str, Any]:
     if candidate is not None:
         manifest["entry_structure"] = {
             "kind": candidate.kind,
+            "file_offset": hexs(context.file_offset_of(candidate.image_offset), 6),
             "image_offset": hexs(candidate.image_offset, 6),
             "runtime_address": hexs(
                 (base + candidate.image_offset) if base is not None else None, 8
             ),
             "confidence": round(candidate.confidence, 4),
         }
+
+    # The one tuple every later stage worked from, published so a consumer
+    # need not reassemble it from separate keys and risk pairing this run's
+    # base with another image's entry.
+    placement = context.get("selected_placement")
+    if placement is not None:
+        manifest["placement"] = placement.as_dict()
 
     # Fields only the architecture can name -- the runtime address of its
     # entry structure, its reset-time stack pointer -- come from the backend
@@ -119,7 +127,8 @@ def build(reconstruction: Reconstruction) -> dict[str, Any]:
     ]
 
     manifest["entry_candidates"] = [
-        item.as_dict() for item in (context.get("entry_candidates") or [])[:32]
+        dict(item.as_dict(), file_offset=hexs(context.file_offset_of(item.image_offset), 6))
+        for item in (context.get("entry_candidates") or [])[:32]
     ]
 
     manifest["regions"] = (
@@ -141,6 +150,10 @@ def build(reconstruction: Reconstruction) -> dict[str, Any]:
             "total": len(references),
             "by_kind": counts,
             "by_access": by_access,
+            # Why the instruction behind each reference is believed to be
+            # code at all. Only the trusted rungs establish memory.
+            "by_provenance": references.counts_by_provenance(),
+            "trusted_accesses": len(references.trusted_accesses()),
             "code": [
                 reference.as_dict()
                 for reference in references.of_kind(ReferenceKind.CODE)[:MAX_REFERENCES]
@@ -188,13 +201,16 @@ def build(reconstruction: Reconstruction) -> dict[str, Any]:
     if mcu is not None:
         match = mcu["match"]
         manifest["candidate_mcu"] = mcu["label"]
+        # ``identified_device`` is null unless the firmware identified it.
+        # A caller that wants the best guess reads ``best_candidate``, and
+        # can see from its confidence what the guess is worth.
         manifest["mcu"] = {
             "label": mcu["label"],
             "exact": mcu["exact"],
-            "confidence": round(match.confidence, 4),
-            "device": match.device.name,
-            "vendor": match.device.vendor,
-            "cpu": match.device.cpu,
+            "supplied_family_hint": mcu.get("supplied_hint"),
+            "identified_device": mcu.get("identified_device"),
+            "identification_confidence": mcu.get("identification_confidence"),
+            "best_candidate": dict(mcu["best_candidate"], cpu=match.device.cpu),
         }
         manifest["confidence"]["mcu"] = round(match.confidence, 4)
     candidates = context.get("mcu_candidates") or []
