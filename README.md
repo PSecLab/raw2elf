@@ -22,6 +22,9 @@ dependency list. Out come the ELF and `firmware.raw2elf.json`, a manifest
 holding what was recovered, the alternatives that were rejected, and the
 evidence for each.
 
+Run it with no arguments for an interactive session that holds the image and
+its analysis, so overriding something and looking again is immediate.
+
 Reads raw binaries, Intel HEX, Motorola S-Records, `xxd`, `hexdump -C` and
 bare hex streams. Recovers architecture, load address, entry point, memory
 regions, `.data`/`.bss` initialization, MMIO accesses, a candidate MCU from

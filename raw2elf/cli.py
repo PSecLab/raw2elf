@@ -135,6 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
     queries.add_argument(
         "--probe", action="store_true", help="report architecture probe scores and exit"
     )
+    queries.add_argument(
+        "--shell",
+        action="store_true",
+        help="start an interactive session; the default when given no firmware",
+    )
 
     parser.add_argument(
         "-i",
@@ -218,8 +223,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"{name:<20} {description}")
         return EXIT_OK
 
-    if not arguments.firmware:
-        parser.error("a firmware file is required")
+    if arguments.shell or not arguments.firmware:
+        # With nothing to do, a session is more useful than a usage error.
+        from .shell import run as run_shell
+
+        return run_shell(
+            [arguments.firmware] if arguments.firmware else None,
+            options=options_from(arguments),
+        )
 
     path = Path(arguments.firmware)
     if not path.is_file():

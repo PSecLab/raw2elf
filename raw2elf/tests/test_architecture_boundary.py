@@ -121,7 +121,14 @@ def _neutral_sources() -> list[Path]:
     files: list[Path] = []
     for directory in NEUTRAL_DIRECTORIES:
         files.extend(sorted((PACKAGE / directory).rglob("*.py")))
-    files.extend([PACKAGE / "cli.py", PACKAGE / "reconstruct.py", PACKAGE / "__init__.py"])
+    files.extend(
+        [
+            PACKAGE / "cli.py",
+            PACKAGE / "shell.py",
+            PACKAGE / "reconstruct.py",
+            PACKAGE / "__init__.py",
+        ]
+    )
     return [path for path in files if path.is_file()]
 
 

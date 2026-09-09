@@ -285,6 +285,82 @@ Repeating `-v` adds per-pass timing. Everything shown here, and more, is in the
 
 ## Interactive sessions
 
+Running `raw2elf` with no firmware, or with `--shell`, opens a session that
+holds the image and its analysis in memory:
+
+```
+$ raw2elf
+raw2elf 0.1.0 -- interactive session
+
+  open <file>     read a firmware dump        show <topic>   see the analysis
+  set <k> <v>     override something          why base       what was weighed
+  probe / images  look before analysing       write [file]   emit the ELF
+
+raw2elf> open flash.bin
+flash.bin  Raw binary, 2.0M in 1 segment(s)
+
+raw2elf> images
+Image 0
+  Range:         0x000000-0x009b6f
+  Size:          39K (39792 bytes)
+  Entry:         0x080002e0
+  ...
+
+raw2elf> set mcu STM32G
+  mcu = STM32G
+
+raw2elf> set image 1
+  image = 1
+
+raw2elf> show base
+analysing...
+  base       0x08020000   confidence 0.99
+
+raw2elf> why base
+Candidate load addresses:
+  1. 0x08020000    confidence 0.99    (backend seed)
+       + vector table lands at 0x08020000, aligned to 0x20000
+       ...
+
+raw2elf> write application.elf
+  application.elf  598104 bytes
+  application.raw2elf.json
+
+raw2elf> info
+...
+equivalent command:
+  raw2elf flash.bin --image 1 --mcu STM32G
+```
+
+Working out an awkward dump is not one question, and answering it as a series
+of shell invocations re-reads and re-analyses the image every time. A session
+keeps both, so overriding something and looking again is immediate.
+
+Nothing is only available here. Every setting is a flag, and `info` prints the
+invocation that reproduces the session, so this is a way of arriving at a
+command rather than a replacement for one.
+
+| Command | Does |
+| --- | --- |
+| `open <file>` | Read a dump and report what the format detector made of it. |
+| `detect` | What each input parser thought. |
+| `probe` | How each architecture backend scores the image. |
+| `images` | The programs in the dump. A look: it neither analyses nor asks. |
+| `set` / `unset` | Override something, or go back to inferring it. `set` alone lists them. |
+| `run` | Analyse now, asking if anything cannot be decided. |
+| `show <topic>` | Part of the analysis. A topic name on its own works too. |
+| `why [word]` | `why base` lists the candidates with their evidence; any other word searches the evidence log. |
+| `write [file]` | Emit the ELF and the manifest. |
+| `info` | What is open, what is set, and the equivalent command. |
+
+Topics are `summary`, `base`, `entry`, `images`, `regions`, `startup`, `mmio`,
+`references`, `symbols`, `mcu`, `sections`, `evidence`, `passes` and
+`warnings`. Analysis runs on demand and is held until a setting changes it,
+so `show` after `set` re-runs and the rest is instant. Command and topic names
+tab-complete, and history works where readline is available.
+
+## Answering as it goes
+
 `-i` / `--interactive` asks rather than refusing.
 
 It is not a configuration wizard, and it does not ask you to make judgements
