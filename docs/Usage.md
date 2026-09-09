@@ -81,8 +81,9 @@ Entry point:        0x08000318  (ELF e_entry 0x08000319)
 
 Recovered:
   Code references:   184
+  Constants:         8221   (loaded, never used as an address)
   Flash references:  11
-  RAM references:    13 accessed, 1076 as address literals
+  RAM references:    13 accessed, 31 as address literals
   MMIO accesses:     54
 
 Memory regions:
@@ -109,23 +110,41 @@ Generated:
   mystery.raw2elf.json
 ```
 
-Four details in that output are deliberate, and they say most of what there is
+Several details in that output are deliberate, and they say most of what there is
 to know about how the tool behaves.
 
 **The Flash region is 512K, not 2M.** The erased tail is reported as padding
 and left out of the ELF, so the output is not inflated by 1.5 MiB of `0xff`.
 `--keep-padding` puts it back.
 
+**Constants are counted, not converted.** 8221 values were loaded from literal
+pools and never used as an address by any instruction, so they are reported as
+what they are. A firmware image is full of integers, masks and floating-point
+bit patterns that fall inside plausible SRAM and peripheral windows; calling
+them addresses would invent a memory map out of arithmetic. They are all in the
+manifest under `references.constants`, with the instruction that loaded each
+one.
+
 **RAM references are split by how strong the evidence is.** Thirteen came from
-load and store instructions whose effective address was recovered. The other
-thousand are literals that merely look like RAM addresses, most of them from
-the constant table. Reporting one total for both would make the weak evidence
-look like the strong kind, and the recovered RAM regions are built only from
-the strong kind.
+load and store instructions whose effective address was recovered — something
+dereferenced them. The other thirty-one are values that reached an address
+computation without a memory access being observed. Reporting one total for
+both would make the weak evidence look like the strong kind, and the recovered
+RAM regions are built only from the strong kind.
 
 **The entry point is reported twice.** `0x08000318` is the address; the ELF
 records `0x08000319` because Cortex-M code pointers carry the Thumb bit. Both
 are in the manifest, as `entry` and `elf_entry`.
+
+**Every region shown rests on an observed access.** A range inferred from
+weaker evidence still appears, marked `speculative` with its confidence, and
+stays out of the recovered memory map and out of the ELF:
+
+```
+Memory regions:
+  ram    0x20000000-0x200003ff     1.0K  ram
+  ram    0x24000000-0x240000ff      256  ram2      speculative (0.41)
+```
 
 **The MCU is two families, not a part number.** AT32F4 and STM32F4 are
 register-compatible, so from these accesses the part genuinely cannot be

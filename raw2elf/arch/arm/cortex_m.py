@@ -61,9 +61,14 @@ _EXECUTION_WINDOWS: tuple[tuple[int, int], ...] = (
 #: How far past its own vector table a handler may plausibly live.  Handlers
 #: belong to the image the table heads, and images are not this large.
 HANDLER_LOCALITY = 0x40000
-#: Vector tables examined when scoring a candidate base.  A dump may hold
-#: several images, and the real base is the one that satisfies all of them.
+#: How far past a table its *nearest* handler may be. Code starts immediately
+#: after a vector table, so the first handler is close even when the last one
+#: is not.
+FIRST_HANDLER_LOCALITY = 0x8000
+#: Vector tables examined when scoring a candidate base, beyond the anchor.
 MAX_TABLES_CHECKED = 6
+#: How much a non-anchor image's agreement counts for.
+CORROBORATION = 0.4
 
 EM_ARM = 40
 EF_ARM_EABI_VER5 = 0x05000000
@@ -452,19 +457,37 @@ class CortexMBackend(ArchitectureBackend):
             offset = address - runtime_base
             return offset if 0 <= offset < size else None
 
-        tables = [
+        # The image being converted anchors the base: its own table, entry,
+        # stack pointer and extent have to describe the same thing, so the
+        # base is the one that places *its* table correctly.
+        candidates = context.get("entry_candidates") or []
+        selected = context.get("selected_entry_candidate")
+        anchor = selected if selected is not None else (candidates[0] if candidates else None)
+        anchor_table = anchor.details.get("table") if anchor is not None else None
+
+        others = [
             candidate.details["table"]
-            for candidate in (context.get("entry_candidates") or [])[:MAX_TABLES_CHECKED]
+            for candidate in candidates[:MAX_TABLES_CHECKED]
             if candidate.details.get("table") is not None
+            and candidate is not anchor
         ]
-        for index, table in enumerate(tables):
-            # The chosen entry structure carries full weight; further tables
-            # corroborate at a discount, so one spurious candidate cannot
-            # outvote the real one.
-            weight = 1.0 if index == 0 else 0.6
-            delta, notes = self._assess_table(table, runtime_base, offset_of, image, len(tables) > 1)
-            score += weight * delta
+
+        if anchor_table is not None:
+            delta, notes = self._assess_table(
+                anchor_table, runtime_base, offset_of, image, bool(others)
+            )
+            score += delta
             evidence.extend(notes)
+
+        # Other images corroborate, but never object. A dump may hold an OTA
+        # slot linked for where it will eventually run rather than where it
+        # is stored, and that image disagreeing with the dump's base says
+        # nothing about whether the dump's base is right.
+        for table in others:
+            delta, notes = self._assess_table(table, runtime_base, offset_of, image, True)
+            if delta > 0:
+                score += CORROBORATION * delta
+                evidence.extend(item for item in notes if item.supports)
 
         # Call targets, not every branch target: an absolute code pointer
         # names a function, while a plain branch usually names a label inside
@@ -658,6 +681,27 @@ class CortexMBackend(ArchitectureBackend):
         if handlers:
             lowest = min(handlers) - table_address
             highest = max(handlers) - table_address
+            if 0 <= lowest > FIRST_HANDLER_LOCALITY:
+                # A table is immediately followed by the code it points to.
+                # A base that leaves the nearest handler a long way past the
+                # table has usually put the table where some *other* image's
+                # table belongs, which is how a multi-image dump produces a
+                # base that satisfies the wrong image.
+                score -= 4.0
+                evidence.append(
+                    Evidence(
+                        kind="table_locality",
+                        source=_SOURCE,
+                        explanation=(
+                            f"the nearest handler{where} would be {lowest:#x} bytes past its own "
+                            f"vector table at {table_address:#010x}, where code normally starts "
+                            "immediately after it"
+                        ),
+                        value=lowest,
+                        weight=4.0,
+                        supports=False,
+                    )
+                )
             if lowest < 0:
                 score -= 3.0
                 evidence.append(
@@ -872,8 +916,35 @@ class CortexMBackend(ArchitectureBackend):
 
         return context.cache("cortexm_code_addresses", build)
 
+    def _dereferenced(self, context) -> frozenset[int]:
+        """Values something used as the base of a memory access.
+
+        This is the evidence that turns a literal into a pointer. A value
+        loaded and then never used to reach memory is a constant, whatever
+        range it happens to fall in.
+        """
+
+        def build() -> frozenset[int]:
+            addresses: set[int] = set()
+            for reference in self._recovery(context).references:
+                if not reference.access.touches_memory:
+                    continue
+                addresses.add(reference.value)
+                if reference.base_value is not None:
+                    addresses.add(reference.base_value)
+            return frozenset(addresses)
+
+        return context.cache("cortexm_dereferenced", build)
+
     def classify_reference(self, reference: Reference, context) -> ReferenceKind:
         address_class = reference.address_class or self.classify_address(reference.value)
+
+        if not reference.access.touches_memory:
+            # Nothing dereferenced it. It is a constant unless some other
+            # instruction was seen using the same value as an address.
+            if reference.value not in self._dereferenced(context):
+                return ReferenceKind.CONSTANT
+
         if address_class == AddressClass.RAM:
             return ReferenceKind.RAM
         if address_class in (AddressClass.MMIO, AddressClass.SYSTEM):

@@ -27,6 +27,7 @@ from ..core.memory import (
 )
 from ..core.pipeline import AnalysisContext, AnalysisPass
 from ..core.reference import Access, ReferenceKind, ReferenceSet
+from .devices import layout_for
 from ..core.util import align_down, align_up, human_size
 
 #: Addresses further apart than this belong to different RAM banks.
@@ -42,6 +43,86 @@ MMIO_GRANULARITY = 0x400
 MIN_RAM_REFERENCES = 3
 #: Trailing erased flash at least this large is left out of the ELF.
 PADDING_TRIM_THRESHOLD = 0x10000
+#: Below this a region is not worth reporting at all.
+MIN_REGION_CONFIDENCE = 0.25
+#: At or above this a region counts as established rather than speculative.
+ESTABLISHED_CONFIDENCE = 0.6
+
+
+def _region_confidence(
+    name: str,
+    addresses: set,
+    instructions: set,
+    writes: set,
+    anchored: bool,
+    layout,
+) -> tuple:
+    """How much a cluster of accesses is worth believing.
+
+    Weighted by what the evidence *is*, not how much of it there is. One
+    instruction reaching one address is a fact about that instruction; a
+    dozen instructions reaching a dozen addresses, some of them writing, is
+    a memory region. Startup boundaries and a known part's memory map settle
+    it either way.
+    """
+    from ..core.evidence import Evidence
+    from ..core.util import logistic
+
+    notes = []
+    score = 0.0
+    if anchored:
+        score += 3.0
+        notes.append(
+            Evidence(
+                kind="region",
+                source="MemoryRegionRecovery",
+                explanation="a startup boundary or the reset stack pointer falls in this range",
+                weight=3.0,
+            )
+        )
+    if writes:
+        score += 1.5
+        notes.append(
+            Evidence(
+                kind="region",
+                source="MemoryRegionRecovery",
+                explanation=f"{len(writes)} address(es) in this range are written",
+                value=len(writes),
+                weight=1.5,
+            )
+        )
+    score += min(len(instructions) * 0.4, 2.0)
+    score += min(len(addresses) * 0.3, 1.5)
+    notes.append(
+        Evidence(
+            kind="region",
+            source="MemoryRegionRecovery",
+            explanation=(
+                f"{len(instructions)} instruction(s) reach {len(addresses)} distinct "
+                f"{name} address(es)"
+            ),
+            value=len(instructions),
+        )
+    )
+    if layout and any(
+        origin <= address < origin + LAYOUT_WINDOW
+        for origin in layout
+        for address in addresses
+    ):
+        score += 1.5
+        notes.append(
+            Evidence(
+                kind="region",
+                source="MemoryRegionRecovery",
+                explanation="the range agrees with where the named part maps memory",
+                weight=1.5,
+            )
+        )
+    return logistic(score, midpoint=2.5, steepness=0.9), notes
+
+
+#: How far past a family's memory origin still counts as that memory.
+LAYOUT_WINDOW = 0x00100000
 
 
 class StartupAnalysis(AnalysisPass):
@@ -176,74 +257,88 @@ class MemoryRegionRecovery(AnalysisPass):
         references: ReferenceSet = context.get("references") or ReferenceSet()
         startup: Optional[StartupState] = context.get("startup_state")
 
-        anchors: dict[int, list[Evidence]] = {}
-
-        def anchor(address: int, evidence: Evidence) -> None:
-            anchors.setdefault(address, []).append(evidence)
-
+        #: address -> the instructions that reached it
+        touched: dict[int, set[int]] = {}
         writes: set[int] = set()
         for reference in references.of_kind(ReferenceKind.RAM):
-            anchor(
-                reference.value,
-                Evidence(
-                    kind="ram_reference",
-                    source=self.name,
-                    explanation=(
-                        f"{reference.access.value.lower()} of {reference.width or 32} bits at "
-                        f"{reference.value:#010x} ({reference.derivation})"
-                    ),
-                    value=reference.value,
-                    confidence=reference.confidence,
-                ),
-            )
+            if not reference.access.touches_memory:
+                # A constant that looks like a RAM address is not a RAM bank.
+                continue
+            touched.setdefault(reference.value, set()).add(reference.source_offset)
             if reference.access == Access.WRITE:
                 writes.add(reference.value)
+
+        anchors: dict[int, list[Evidence]] = {
+            address: [
+                Evidence(
+                    kind="ram_access",
+                    source=self.name,
+                    explanation=(
+                        f"{len(sites)} instruction(s) access {address:#010x}"
+                        + (" including a write" if address in writes else "")
+                    ),
+                    value=address,
+                )
+            ]
+            for address, sites in touched.items()
+        }
 
         required: set[int] = set()
         if startup is not None:
             for initialization in startup.initializations:
                 size = initialization.resolved_size or 0
-                for address in (initialization.destination, initialization.destination + max(size - 1, 0)):
-                    anchor(
-                        address,
+                for address in (
+                    initialization.destination,
+                    initialization.destination + max(size - 1, 0),
+                ):
+                    anchors.setdefault(address, []).append(
                         Evidence(
                             kind="startup_init",
                             source=self.name,
                             explanation=(
                                 f"startup {initialization.kind.value} initializes "
-                                f"{initialization.destination:#010x}..{initialization.destination + size:#010x}"
+                                f"{initialization.destination:#010x}.."
+                                f"{initialization.destination + size:#010x}"
                             ),
                             value=initialization.destination,
                             confidence=initialization.confidence,
-                        ),
+                        )
                     )
                     required.add(address)
             if startup.initial_stack_pointer is not None:
                 pointer = startup.initial_stack_pointer
-                anchor(
-                    pointer - 1,
+                anchors.setdefault(pointer - 1, []).append(
                     Evidence(
                         kind="stack_pointer",
                         source=self.name,
-                        explanation=f"initial stack pointer {pointer:#010x} sits at the top of this bank",
+                        explanation=(
+                            f"initial stack pointer {pointer:#010x} sits at the top of this bank"
+                        ),
                         value=pointer,
-                    ),
+                    )
                 )
                 required.add(pointer - 1)
 
+        layout = layout_for(context.options.mcu) if context.options.mcu else None
         regions: list[MemoryRegion] = []
         for index, group in enumerate(cluster(anchors, RAM_BANK_GAP)):
-            distinct = len(group)
             members = set(group)
-            anchored = bool(required & members) or bool(writes & members)
-            if not anchored and distinct < MIN_RAM_REFERENCES:
+            sites = {site for address in group for site in touched.get(address, ())}
+            confidence, notes = _region_confidence(
+                name="RAM",
+                addresses=members,
+                instructions=sites,
+                writes=writes & members,
+                anchored=bool(required & members),
+                layout=layout.ram if layout else (),
+            )
+            if confidence < MIN_REGION_CONFIDENCE:
                 continue
             start = align_down(min(group), RAM_GRANULARITY)
             end = align_up(max(group) + 1, RAM_GRANULARITY)
-            evidence: list[Evidence] = []
-            for address in group:
-                evidence.extend(anchors[address][:2])
-            confidence = 0.9 if anchored else min(0.5 + 0.05 * distinct, 0.85)
+            evidence: list[Evidence] = list(notes)
+            for address in sorted(group)[:4]:
+                evidence.extend(anchors[address][:1])
             regions.append(
                 MemoryRegion(
                     kind=RegionKind.RAM,
@@ -252,6 +347,7 @@ class MemoryRegionRecovery(AnalysisPass):
                     name="ram" if index == 0 else f"ram{index}",
                     writable=True,
                     confidence=confidence,
+                    speculative=confidence < ESTABLISHED_CONFIDENCE,
                     evidence=tuple(evidence[:6]),
                 )
             )
@@ -261,17 +357,33 @@ class MemoryRegionRecovery(AnalysisPass):
 
     def _mmio(self, context: AnalysisContext) -> list[MemoryRegion]:
         accesses = context.get("peripheral_accesses") or context.get("mmio_accesses") or []
-        if not accesses:
-            return []
-        by_address: dict[int, list] = {}
+        touched: dict[int, set[int]] = {}
+        writes: set[int] = set()
         for reference in accesses:
-            by_address.setdefault(reference.value, []).append(reference)
+            if not reference.access.touches_memory:
+                continue
+            touched.setdefault(reference.value, set()).add(reference.source_offset)
+            if reference.access == Access.WRITE:
+                writes.add(reference.value)
+        if not touched:
+            return []
 
         regions: list[MemoryRegion] = []
-        for index, group in enumerate(cluster(by_address, MMIO_GAP)):
+        for index, group in enumerate(cluster(touched, MMIO_GAP)):
+            members = set(group)
+            sites = {site for address in group for site in touched[address]}
+            confidence, notes = _region_confidence(
+                name="peripheral",
+                addresses=members,
+                instructions=sites,
+                writes=writes & members,
+                anchored=False,
+                layout=(),
+            )
+            if confidence < MIN_REGION_CONFIDENCE:
+                continue
             start = align_down(min(group), MMIO_GRANULARITY)
             end = align_up(max(group) + 1, MMIO_GRANULARITY)
-            hits = sum(len(by_address[address]) for address in group)
             regions.append(
                 MemoryRegion(
                     kind=RegionKind.MMIO,
@@ -279,18 +391,9 @@ class MemoryRegionRecovery(AnalysisPass):
                     size=end - start,
                     name=f"mmio{index}",
                     writable=True,
-                    confidence=0.9,
-                    evidence=(
-                        Evidence(
-                            kind="mmio_access",
-                            source=self.name,
-                            explanation=(
-                                f"{hits} recovered access(es) to {len(group)} distinct register(s) "
-                                f"in {start:#010x}..{end - 1:#010x}"
-                            ),
-                            value=hits,
-                        ),
-                    ),
+                    confidence=confidence,
+                    speculative=confidence < ESTABLISHED_CONFIDENCE,
+                    evidence=tuple(notes),
                 )
             )
         return regions

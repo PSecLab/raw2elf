@@ -74,6 +74,12 @@ def summary(reconstruction: Reconstruction, outputs: Sequence[str] = ()) -> str:
         lines.append("")
         lines.append("Recovered:")
         lines.append(f"  Code references:   {counts.get(ReferenceKind.CODE.value, 0)}")
+        constants = counts.get(ReferenceKind.CONSTANT.value, 0)
+        if constants:
+            lines.append(
+                f"  Constants:         {constants}"
+                f"   (loaded, never used as an address)"
+            )
         lines.append(f"  Flash references:  {counts.get(ReferenceKind.FLASH_DATA.value, 0)}")
         lines.append(
             f"  RAM references:    {ram_accessed} accessed"
@@ -84,10 +90,18 @@ def summary(reconstruction: Reconstruction, outputs: Sequence[str] = ()) -> str:
     if memory_map is not None and len(memory_map):
         lines.append("")
         lines.append("Memory regions:")
-        for region in memory_map:
+        for region in memory_map.established:
             lines.append(
                 f"  {region.kind.value:<6} 0x{region.start:08x}-0x{region.end:08x}"
                 f"  {human_size(region.size):>7}  {region.name}"
+            )
+        for region in memory_map.speculative:
+            # Reported, but plainly marked: these rest on weaker evidence
+            # than an instruction actually reaching the address.
+            lines.append(
+                f"  {region.kind.value:<6} 0x{region.start:08x}-0x{region.end:08x}"
+                f"  {human_size(region.size):>7}  {region.name}"
+                f"   speculative ({region.confidence:.2f})"
             )
 
     if startup is not None and startup.initializations:

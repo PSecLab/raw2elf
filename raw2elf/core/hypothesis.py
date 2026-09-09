@@ -77,13 +77,23 @@ class BaseCandidate:
 
 @dataclass
 class ImageHypothesis:
-    """A complete guess at one firmware image inside the input."""
+    """A complete guess at one firmware image inside the input.
+
+    Every field describes the *same* image. A dump holding a bootloader and
+    an application has two of these, each with its own base, entry and entry
+    structure; mixing a base from one with an entry from another produces a
+    result that looks plausible and is wrong.
+    """
 
     architecture: str
     image_offset: int
     image_size: int
     runtime_base: Optional[int] = None
     entry: Optional[int] = None
+    #: Runtime address of the structure the entry came from.
+    entry_structure: Optional[int] = None
+    #: Reset-time stack pointer, where the architecture has one.
+    initial_stack_pointer: Optional[int] = None
     score: float = 0.0
     confidence: float = 0.0
     evidence: list[Evidence] = field(default_factory=list)
@@ -101,6 +111,8 @@ class ImageHypothesis:
             "image_size": self.image_size,
             "runtime_base": hexs(self.runtime_base, 8),
             "entry": hexs(self.entry, 8),
+            "entry_structure": hexs(self.entry_structure, 8),
+            "initial_stack_pointer": hexs(self.initial_stack_pointer, 8),
             "score": round(self.score, 3),
             "confidence": round(self.confidence, 3),
             "evidence": [str(item) for item in self.evidence],

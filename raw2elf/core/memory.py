@@ -30,6 +30,9 @@ class MemoryRegion:
     executable: bool = False
     loadable: bool = False
     confidence: float = 0.5
+    #: Inferred from values that were never dereferenced. Reported, so that
+    #: nothing is silently discarded, but not treated as recovered memory.
+    speculative: bool = False
     evidence: tuple[Evidence, ...] = ()
 
     @property
@@ -52,6 +55,7 @@ class MemoryRegion:
             + ("w" if self.writable else "-")
             + ("x" if self.executable else "-"),
             "loadable": self.loadable,
+            "speculative": self.speculative,
             "confidence": round(self.confidence, 3),
             "evidence": [item.explanation for item in self.evidence],
         }
@@ -70,6 +74,15 @@ class MemoryMap:
     def of_kind(self, *kinds: RegionKind) -> list[MemoryRegion]:
         wanted = set(kinds)
         return [region for region in self._regions if region.kind in wanted]
+
+    @property
+    def established(self) -> list[MemoryRegion]:
+        """Regions something actually accessed."""
+        return [region for region in self._regions if not region.speculative]
+
+    @property
+    def speculative(self) -> list[MemoryRegion]:
+        return [region for region in self._regions if region.speculative]
 
     def region_for(self, address: int) -> Optional[MemoryRegion]:
         for region in self._regions:

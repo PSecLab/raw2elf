@@ -83,7 +83,10 @@ Only the excess over the chance rate scores.
 **The table's offset must be one VTOR could address.** VTOR ignores the low
 seven bits and an image's base is at least that aligned, so a real table sits
 at a 128-byte-aligned offset within its image. Data that happens to resemble a
-table lands anywhere.
+table lands anywhere. This is architectural rather than statistical, so it is
+applied as a hard rejection while tables are being found, before anything is
+scored — an unaddressable offset never becomes a candidate at all, however
+convincing its contents.
 
 On a real dump where floating-point tables and string data had been scoring as
 high as 0.92, these leave only the genuine images standing.
@@ -170,24 +173,55 @@ entry points, and value propagation yields effective addresses for loads and
 stores, resolved indirect branch targets, and the pointers startup code sets
 up.
 
-### A literal is not assumed to be a pointer
+### A literal is not an address until something dereferences it
 
 A literal pool value may be an address, an integer, a bitmask, a
 floating-point value, a peripheral address, a RAM pointer or a code pointer.
 Every reference therefore keeps its provenance — the producing instruction, its
-offset, and how the value was derived — and classification waits until the
-memory map is known.
+offset, and how the value was derived — and classification waits until
+something is seen to *use* the value.
 
-The classes are `CODE`, `FLASH_DATA`, `RAM`, `MMIO` and `UNKNOWN`, each with an
-access of `READ`, `WRITE`, `EXECUTE` or `ADDRESS_ONLY`.
+The classes are `CONSTANT`, `CODE`, `FLASH_DATA`, `RAM`, `MMIO` and `UNKNOWN`,
+each with an access of `READ`, `WRITE`, `EXECUTE` or `ADDRESS_ONLY`.
 
-Classification is deliberately conservative. A value is called `CODE` only if
-it points at an address that actually decoded as an instruction, or if the
-instruction executed it. The Thumb bit makes a code pointer look distinctive,
-but plenty of ordinary constants are odd, and a literal pointing one byte into
-a string is not a function. The cost of that conservatism is that a pointer
-into code which discovery never reached is reported as `FLASH_DATA`; the
-benefit is that the `CODE` class stays trustworthy.
+`CONSTANT` is the honest default, and it is where most literals stay. A value
+loaded by `ldr r3, [pc, #N]` is a value; whether it is an address is a separate
+question that the load itself cannot answer. Falling inside a plausible SRAM or
+peripheral window is not an answer either — a firmware image is full of
+integers that do. `0x3dcccccd` is the float `0.1` and also looks exactly like
+an STM32 SRAM pointer.
+
+A value is promoted out of `CONSTANT` only when the analysis observes it being
+dereferenced: the recovered effective address of a load or store, the target of
+a branch, or a pointer startup code follows. Everything else keeps its literal
+value, its producing instruction and its offset, and is reported as a constant
+— visible, but not claimed to be memory.
+
+Two instruction-level rules settle the obvious cases before scoring begins:
+
+- A literal loaded into a floating-point register (`VLDR`) is a floating-point
+  constant. The destination register makes that unambiguous, so those loads
+  never produce address candidates at all.
+- `ADDRESS_ONLY` and the three memory accesses are kept distinct throughout.
+  "This value was observed" and "this address was accessed" are different
+  claims, and only the second supports a memory region.
+
+`CODE` remains the strictest class: a value is called `CODE` only if it points
+at an address that actually decoded as an instruction, or if the instruction
+executed it. The Thumb bit makes a code pointer look distinctive, but plenty of
+ordinary constants are odd, and a literal pointing one byte into a string is
+not a function. The cost of that conservatism is that a pointer into code which
+discovery never reached is reported as `FLASH_DATA`; the benefit is that the
+`CODE` class stays trustworthy.
+
+The console summary reports the two populations separately, so the difference
+is visible without reading the manifest:
+
+```
+  Code references:   184
+  Constants:         8221   (loaded, never used as an address)
+  RAM references:    13 accessed, 31 as address literals
+```
 
 ## Memory regions
 
@@ -201,14 +235,47 @@ Taking every aligned 32-bit integer in the image, sorting it, and calling the
 gaps RAM or MMIO produces far more false positives than useful regions, so it
 is not done.
 
-A cluster is kept if it contains a recovered *store* — the instruction wrote
-there, so the memory exists and is writable — or a startup boundary, or at
-least three distinct read references. Multiple RAM banks are expected rather
-than merged, including banks in the architectural code region, where vendors
-place CCM and tightly-coupled SRAM.
+Only references whose access actually touched memory contribute. A constant
+that resembles a RAM address is not a RAM bank, however many of them a literal
+pool holds.
+
+Multiple RAM banks are expected rather than merged, including banks in the
+architectural code region, where vendors place CCM and tightly-coupled SRAM.
 
 The reported Flash regions describe the bytes that actually reach the ELF, not
 the whole input, so a dump with a large erased tail reports the trimmed size.
+
+### Established and speculative regions
+
+A cluster's confidence reflects what the evidence *is*, not how much of it
+there is. One instruction reaching one address is a fact about that
+instruction; a dozen instructions reaching a dozen addresses, some of them
+writing, is a memory region. The weighing is:
+
+| Evidence | Contribution |
+| --- | --- |
+| A startup boundary or the reset stack pointer falls in the range | strongest |
+| Addresses in the range are written | strong |
+| Distinct instructions reach the range | accumulates, capped |
+| Distinct addresses within the range | accumulates, capped |
+| The range agrees with where a named part maps memory | strong |
+
+Below a floor, a cluster is not reported at all. Above it but below the
+established threshold, the region is reported and marked **speculative**:
+visible in the console and in the manifest under `speculative_regions`, so
+nothing is silently discarded, but not treated as recovered memory. Only
+established regions are described as part of the recovered memory map.
+
+Neither kind is inserted into the ELF. RAM and MMIO regions are analysis
+output; the ELF's `PT_LOAD` segments come from the image bytes and from the
+`.data`/`.bss` extents recovered from startup code, which have their own
+evidence. A speculative region cannot widen an ELF segment.
+
+Where a part number is known, its documented Flash and SRAM origins are used as
+*validation*: a recovered region that agrees with the part's memory map gains
+confidence, and one that does not is reported without that support rather than
+suppressed. A part number is a hint about the layout, not a source of regions
+in its own right.
 
 ## Startup state
 
@@ -319,7 +386,24 @@ access-direction contradictions count, but only lightly.
 
 A match adds peripheral base symbols, renames device interrupt handlers from
 `IRQ37_Handler` to `USART1_IRQHandler`, and with `--svd-symbols registers` adds
-register symbols such as `RCC_CFGR`. `--mcu NAME` skips ranking entirely.
+register symbols such as `RCC_CFGR`.
+
+### A supplied part number is a hint, not an identification
+
+`--mcu NAME` skips ranking, and what it produces is labelled accordingly:
+`STM32G474RET6 (supplied)`, not marked exact, and carrying the evidence line
+*"was supplied rather than identified"*. Confidence is never reported as 1.0
+for a name the tool did not derive from the firmware. The user told the tool
+what the part is; the tool did not find out.
+
+The same rule covers anything outside the bytes. **No analysis reads the input
+filename.** A file called `stm32f407_app.bin` is analysed identically to the
+same bytes called `dump.bin`, and there is a test that asserts it. Names are
+evidence about the person who saved the file, not about the firmware.
+
+What a supplied part number *is* good for is its memory map: its documented
+Flash and SRAM origins seed base candidates and validate recovered regions,
+both of which are checked against the bytes rather than believed outright.
 
 ## Dumps with several images
 
@@ -353,15 +437,36 @@ A selected image is analysed in its own right and inherits no conclusion drawn
 in the enclosing dump's coordinate system — offsets restart at zero, and the
 file offset it came from is kept for reporting.
 
+### Every recovered fact describes one image
+
+Base, entry, entry structure, initial stack pointer and extent form a tuple,
+and a tuple is only meaningful about a single image. Each candidate image
+therefore carries its own complete tuple — `runtime_base`, `entry`,
+`entry_structure` and `initial_stack_pointer` — rather than sharing fields with
+its neighbours. Mixing a base recovered from one image with an entry recovered
+from another produces a result in which every individual number looks
+reasonable and the combination is nonsense.
+
 Without `--image`, the dump is reconstructed as one span of flash. Base
-recovery then weighs *all* the vector tables it found, which matters because
-each table on its own is consistent with a base that lines its handlers up with
-some other image's code. A staged OTA image is linked for where it will
-eventually run rather than where it is stored, so its table disagrees with the
-dump's base. The chosen entry structure carries full weight and further tables
-corroborate at a discount, so one disagreeing table cannot outvote the real
-one; the disagreement is recorded as evidence against the candidate rather than
-silently averaged in, and the dump's real base still comes out.
+recovery then **anchors on the image being converted**: the base is the one
+that places *that* image's table, entry and stack pointer consistently. Other
+tables in the dump may corroborate that base, at a discount, but they never
+object to it. A staged OTA image is linked for where it will eventually run
+rather than where it is stored, so its table legitimately disagrees with the
+dump's base, and that disagreement says nothing about whether the dump's base
+is right.
+
+The failure this prevents is specific. Given a bootloader at file offset 0 and
+an application at 0x20000, a base of `0x07fe0000` places the *application's*
+table exactly where the bootloader's table belongs. Every constituent check
+passes; the answer is wrong by one image. Anchoring, plus the first-handler
+locality rule below, rules it out.
+
+**A table is immediately followed by the code it points to.** Handlers are
+scattered through an image, but the nearest one is close, because code starts
+right after the vector table. A base that leaves even the nearest handler a
+long way past its own table has usually put that table where some other image's
+table belongs, and is penalized heavily.
 
 ## Padding and holes
 

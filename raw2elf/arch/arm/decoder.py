@@ -295,14 +295,24 @@ class Decoder:
 # -- instruction predicates -----------------------------------------------
 
 
+#: Literal loads whose destination is a floating-point register. The value
+#: is a floating-point constant, not an address, and the register makes that
+#: unambiguous -- 0x3dcccccd is 0.1, not a pointer into SRAM.
+FLOAT_LITERAL_LOADS = frozenset((csarm.ARM_INS_VLDR,))
+
+
+def is_float_literal(instruction: "capstone.CsInsn") -> bool:
+    """True when a literal is being loaded into a floating-point register."""
+    return instruction.id in FLOAT_LITERAL_LOADS
+
+
 def is_literal_load(instruction: "capstone.CsInsn") -> bool:
-    """True for a PC-relative literal load."""
+    """True for a PC-relative literal load into a general-purpose register."""
     if instruction.id not in (
         csarm.ARM_INS_LDR,
         csarm.ARM_INS_LDRD,
         csarm.ARM_INS_LDRB,
         csarm.ARM_INS_LDRH,
-        csarm.ARM_INS_VLDR,
     ):
         return False
     for operand in instruction.operands:

@@ -16,8 +16,16 @@ from .util import fmt_value, hexs
 
 
 class ReferenceKind(str, Enum):
-    """What a reference value appears to denote."""
+    """What a reference value appears to denote.
 
+    ``CONSTANT`` is the honest default for a value an instruction merely
+    loaded. A literal pool holds integers, masks, floating-point bit patterns
+    and string data as well as pointers, and every one of those can fall
+    inside a plausible address range. A value is only promoted out of
+    ``CONSTANT`` when something is seen to use it as an address.
+    """
+
+    CONSTANT = "CONSTANT"
     CODE = "CODE"
     FLASH_DATA = "FLASH_DATA"
     RAM = "RAM"
@@ -26,12 +34,22 @@ class ReferenceKind(str, Enum):
 
 
 class Access(str, Enum):
-    """How the referenced location is used by the producing instruction."""
+    """How the referenced location is used by the producing instruction.
+
+    ``ADDRESS_ONLY`` means a value was produced and nothing more: the
+    instruction did not touch the memory it might name. Only ``READ``,
+    ``WRITE`` and ``EXECUTE`` are evidence that the address exists.
+    """
 
     READ = "READ"
     WRITE = "WRITE"
     EXECUTE = "EXECUTE"
     ADDRESS_ONLY = "ADDRESS_ONLY"
+
+    @property
+    def touches_memory(self) -> bool:
+        """Whether the instruction actually used the address."""
+        return self in (Access.READ, Access.WRITE, Access.EXECUTE)
 
 
 class AddressClass(str, Enum):
@@ -117,6 +135,10 @@ class ReferenceSet:
     def base_discriminating(self) -> list[Reference]:
         """References whose value does not move with the image load address."""
         return [ref for ref in self._references if ref.useful_for_base and not ref.base_relative]
+
+    def accesses(self) -> list[Reference]:
+        """References where an instruction actually touched the address."""
+        return [ref for ref in self._references if ref.access.touches_memory]
 
     def replace_all(self, references: Iterable[Reference]) -> None:
         self._references = list(references)

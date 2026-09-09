@@ -788,9 +788,24 @@ class SvdMatcher(AnalysisPass):
 
         selected = matches[0]
         if context.options.mcu:
-            selected.confidence = 1.0
-            label = selected.device.name
-            exact = True
+            # Being told what the part is does not make it identified. The
+            # confidence stays whatever the recovered accesses support, so a
+            # name that the evidence does not corroborate cannot masquerade
+            # as a device identification.
+            label = f"{context.options.mcu} (supplied)"
+            exact = False
+            context.note(
+                Evidence(
+                    kind="mcu",
+                    source=self.name,
+                    explanation=(
+                        f"{context.options.mcu} was supplied rather than identified; the "
+                        f"confidence shown is what the recovered accesses support on their own"
+                    ),
+                    value=context.options.mcu,
+                    weight=0.0,
+                )
+            )
         else:
             tied = [item for item in matches if matches[0].score - item.score <= TIE_MARGIN]
             exact = len(tied) == 1

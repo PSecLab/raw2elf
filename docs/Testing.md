@@ -22,6 +22,9 @@ the package's parent directory on `sys.path`, so the suite runs from anywhere.
 | `test_svd.py` | SVD indexing, targeted register parsing, ranking, family naming, and graceful absence. |
 | `test_multi_image.py` | Padding detection, image discovery and extents, carving, staged images, RAM banks, large dumps. |
 | `test_cli.py` | Every output, override, query and failure path, plus module and script invocation. |
+| `test_interactive.py` | The questions asked when evidence runs out: what is asked, when, and that answers are used rather than merely recorded. |
+| `test_shell.py` | The interactive session: opening, settings and staleness, topics, `why`, writing, completion, and the boundary it must respect. |
+| `test_inference_is_conservative.py` | The ways inference can outrun its evidence — image tuples staying together, constants not becoming addresses, regions resting on real accesses, a supplied part number claiming nothing. |
 | `test_end_to_end.py` | The graded metric matrix over every firmware in every format. |
 
 Tests that need external tools skip cleanly without them. The `objdump` check

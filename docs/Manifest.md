@@ -65,18 +65,19 @@ bumped only for an incompatible layout change.
 | `entry_structure` | The chosen entry structure: kind, image offset, runtime address, confidence. |
 | `architecture_candidates` | Every backend's probe confidence and details. |
 | `base_candidates` | Ranked load addresses, each with score, confidence, origin, and its evidence. |
-| `images` | Candidate firmware images found in the input. |
+| `images` | Candidate firmware images found in the input, each with its own complete tuple: `runtime_base`, `entry`, `entry_structure` and `initial_stack_pointer`. |
 | `entry_candidates` | Every entry structure found, with its evidence. |
-| `regions` | Recovered memory map: type, bounds, size, permissions, confidence, evidence. |
+| `regions` | Recovered memory map: type, bounds, size, permissions, confidence, evidence. Every region here rests on an observed memory access, a startup boundary or the reset stack pointer. |
+| `speculative_regions` | Ranges the evidence suggests but does not establish, in the same shape. Reported so nothing is discarded silently; not part of the recovered memory map, and never present in the ELF. |
 | `elf_sections` | The allocated sections actually emitted. |
 | `padding` | Every detected padding run: offset, size, byte value. |
-| `references` | Totals by kind and by access, plus the classified `code`, `ram` and `flash_data` reference lists. |
+| `references` | Totals by kind and by access, plus the `code`, `ram`, `flash_data` and `constants` reference lists. |
 | `mmio_accesses` | Every recovered peripheral access with direction, width, base and displacement. |
 | `startup` | The initial stack pointer and every recovered memory initialization. |
 | `data_initialization` | The `.data`-style copies, extracted from `startup` for convenience. |
 | `bss` | The `.bss`-style cleared ranges, likewise. |
 | `interrupts` | The full handler table: index, IRQ number, name, handler address, and whether the vector is architectural. |
-| `mcu`, `mcu_candidates` | The chosen MCU and the ranked alternatives with their scores. |
+| `mcu`, `mcu_candidates` | The chosen MCU and the ranked alternatives with their scores. A part supplied with `--mcu` appears as `NAME (supplied)` with `exact` false — see [A supplied part number is a hint](Recovery.md#a-supplied-part-number-is-a-hint-not-an-identification). |
 | `peripherals`, `peripheral_registers` | Peripheral and register annotations from a confident SVD match. |
 | `symbols` | Every emitted symbol with its value, size, kind, and the analysis that produced it. |
 | `evidence` | The full evidence log for the run. |
@@ -141,6 +142,51 @@ form, with a `type`, the `source` that produced them, a `value`, a
 displacement it was built from, and `source_offset` where in the image the
 instruction lives. That is enough to go back to the instruction and check the
 conclusion by hand.
+
+### Constants, and what separates them from addresses
+
+`by_kind` and `by_access` divide the same references two ways, and reading them
+together is the quickest check on how much the run is claiming:
+
+```json
+"references": {
+  "total": 8518,
+  "by_kind":   { "CONSTANT": 8221, "CODE": 184, "MMIO": 69, "RAM": 44 },
+  "by_access": { "ADDRESS_ONLY": 8267, "EXECUTE": 184, "WRITE": 45, "READ": 22 }
+}
+```
+
+`CONSTANT` with `ADDRESS_ONLY` is a value some instruction loaded and nothing
+dereferenced. That is most of a literal pool, and it stays a constant however
+much it resembles an address. `READ`, `WRITE` and `EXECUTE` mark the references
+where an address was actually used, and those are the only ones that support a
+memory region. The `constants` list carries them with their producing
+instruction, so nothing is lost by not calling them addresses.
+
+### A region and what it rests on
+
+```json
+{
+  "type": "ram",
+  "name": "ram",
+  "start": "0x20000000",
+  "end": "0x200003ff",
+  "size": 1024,
+  "permissions": "rw-",
+  "loadable": false,
+  "speculative": false,
+  "confidence": 0.993,
+  "evidence": [
+    "a startup boundary or the reset stack pointer falls in this range",
+    "4 address(es) in this range are written",
+    "11 instruction(s) reach 7 distinct RAM address(es)"
+  ]
+}
+```
+
+`speculative` is the field to branch on. A consumer building a memory map
+should use `regions`; `speculative_regions` is for a human deciding whether to
+look further.
 
 ### Startup state
 
@@ -214,7 +260,8 @@ if report["confidence"]["base"] < 0.9:
 Consumers should treat missing keys as "not recovered" rather than as an error:
 `vector_table` is absent for a backend with no such concept, `mcu` is absent
 when no part was identified, and `data_initialization` is absent when startup
-analysis found nothing. That is the difference between "zero" and "unknown",
+analysis found nothing. `speculative_regions` is the other case: it is always
+present, and empty means "none", which is a result rather than a gap. That is the difference between "zero" and "unknown",
 and the manifest keeps it.
 
 Long lists are capped so the manifest stays a file rather than a dump: 2000

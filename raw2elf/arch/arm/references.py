@@ -48,6 +48,8 @@ class SweepResult:
     call_locations: set[int] = field(default_factory=set)
     instructions: int = 0
     literal_loads: int = 0
+    #: Values seen in literal pools, whatever they turn out to mean.
+    literal_values: set[int] = field(default_factory=set)
     truncated: bool = False
 
 
@@ -101,6 +103,7 @@ def sweep_image(
                                     confidence=0.45,
                                 )
                             )
+                            result.literal_values.add(value)
                 continue
 
             if identifier == csarm.ARM_INS_MOVW and len(operands) >= 2:
@@ -242,9 +245,11 @@ def recover_accesses(
 def _from_event(event, classify: Callable[[int], AddressClass]) -> Reference:
     address_class = classify(event.address)
     if event.derivation == "pc-relative literal":
+        # Loading a value says nothing about what it is. Classification waits
+        # for something to use it as an address.
         access = Access.ADDRESS_ONLY
-        kind = ReferenceKind.UNKNOWN
-        confidence = 0.5
+        kind = ReferenceKind.CONSTANT
+        confidence = 0.3
     else:
         access = Access.WRITE if event.is_write else Access.READ
         kind = _kind_for(address_class)

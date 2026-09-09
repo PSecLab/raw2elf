@@ -358,14 +358,23 @@ def test_svd_symbols_can_be_turned_off_entirely(standard, svd_root):
     assert not any(name.endswith("_BASE") for name in symbols)
 
 
-def test_an_analyst_supplied_mcu_wins(standard, svd_root):
+def test_a_supplied_mcu_is_a_hint_not_an_identification(standard, svd_root):
+    """Being told the part must not produce certainty about the part.
+
+    The confidence shown has to stay whatever the recovered accesses support,
+    or a name from a filename, a guess or a habit would come back as an
+    identification.
+    """
     reconstruction = reconstruct_bytes(
         standard.image, enable_svd=True, svd=str(svd_root), mcu="ACME32F405"
     )
     mcu = reconstruction.context.get("mcu")
-    assert mcu["label"] == "ACME32F405"
-    assert mcu["exact"] is True
-    assert mcu["match"].confidence == 1.0
+    assert "ACME32F405" in mcu["label"]
+    assert "supplied" in mcu["label"]
+    assert mcu["exact"] is False
+    assert mcu["match"].confidence < 1.0
+    assert any("was supplied rather than identified" in str(item)
+               for item in reconstruction.context.evidence)
 
 
 def test_an_unmatched_mcu_name_widens_rather_than_giving_up(standard, svd_root):

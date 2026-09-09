@@ -61,11 +61,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     options = Options(minimum_confidence=0.0, enable_svd=arguments.svd)
     summary = metrics.Summary()
 
+    unreadable: list[str] = []
     for path in paths:
         try:
             truth = corpus.ground_truth(path)
         except Exception as error:  # noqa: BLE001
             print(f"{path}: cannot read reference ELF: {error}", file=sys.stderr)
+            unreadable.append(str(path))
             continue
         for form in forms:
             grade = metrics.grade(truth, form, options)
@@ -101,11 +103,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"peak {summary.as_dict()['peak_bytes'] / (1 << 20):.1f} MiB"
     )
 
+    # A firmware that was asked for and never graded is a failure of the run,
+    # not a quiet omission -- otherwise a mistyped path reads as a clean pass.
+    if unreadable:
+        print(
+            f"{len(unreadable)} requested firmware(s) could not be read and were not graded: "
+            + ", ".join(unreadable)
+        )
+
     if arguments.json:
         Path(arguments.json).write_text(json.dumps(summary.as_dict(), indent=2) + "\n")
         print(f"report written to {arguments.json}")
 
-    return 0 if not failures else 1
+    return 0 if not failures and not unreadable else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

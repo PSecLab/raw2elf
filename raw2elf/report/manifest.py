@@ -122,7 +122,12 @@ def build(reconstruction: Reconstruction) -> dict[str, Any]:
         item.as_dict() for item in (context.get("entry_candidates") or [])[:32]
     ]
 
-    manifest["regions"] = memory_map.as_list() if memory_map is not None else []
+    manifest["regions"] = (
+        [region.as_dict() for region in memory_map.established] if memory_map is not None else []
+    )
+    manifest["speculative_regions"] = (
+        [region.as_dict() for region in memory_map.speculative] if memory_map is not None else []
+    )
     manifest["elf_sections"] = context.get("elf_sections") or []
 
     manifest["padding"] = [run.as_dict() for run in (context.get("padding") or [])[:64]]
@@ -147,6 +152,10 @@ def build(reconstruction: Reconstruction) -> dict[str, Any]:
             "flash_data": [
                 reference.as_dict()
                 for reference in references.of_kind(ReferenceKind.FLASH_DATA)[:MAX_REFERENCES]
+            ],
+            "constants": [
+                reference.as_dict()
+                for reference in references.of_kind(ReferenceKind.CONSTANT)[:MAX_REFERENCES]
             ],
         }
 

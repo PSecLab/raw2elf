@@ -141,31 +141,43 @@ class VectorTable:
         return max(low, 0), high
 
     def base_seeds(self, remaining_bytes: int) -> list[tuple[int, float]]:
-        """Candidate image bases, coarsest alignment first.
+        """Candidate image bases, most plausible first.
 
-        The table's runtime address is ``base + image_offset`` and must be
-        VTOR-aligned; handlers must land inside the image.  Both prune the
-        alignment-derived candidates.
+        The table's runtime address is ``base + image_offset``, must be one
+        VTOR can address, and must leave every handler inside the image.
+        Among the addresses that satisfy that, the one just below the first
+        handler is preferred: a vector table is immediately followed by the
+        code it points to, so the table ends about where the handlers begin.
+
+        Preferring the coarsest alignment instead puts a second image's table
+        where the first image's belongs, which is how a multi-image dump ends
+        up with a base that describes the wrong image.
         """
         bounds = self.base_range(remaining_bytes)
         if bounds is None:
             return []
         low, high = bounds
-        table_address_guess = min(self.handler_addresses)
+        first_handler = min(self.handler_addresses)
+        required = self.required_alignment
+
         seeds: list[tuple[int, float]] = []
         seen: set[int] = set()
-        required = self.required_alignment
-        for index, alignment in enumerate(BASE_ALIGNMENTS):
-            base = align_down(table_address_guess, alignment) - self.image_offset
+        for alignment in BASE_ALIGNMENTS:
+            if alignment < required:
+                continue
+            table_address = align_down(first_handler, alignment)
+            base = table_address - self.image_offset
             if base < low or base > high or base in seen:
                 continue
-            if (base + self.image_offset) % required:
-                continue
             seen.add(base)
-            # Coarser alignments are the more usual linker choice, so they
-            # start with more weight; the generic pass decides in the end.
-            seeds.append((base, 1.0 - 0.05 * index))
-        return seeds
+            seeds.append((base, first_handler - table_address))
+
+        # Closest below the first handler first, then coarser fallbacks.
+        seeds.sort(key=lambda item: item[1])
+        return [
+            (base, max(1.0 - 0.1 * index, 0.3))
+            for index, (base, _distance) in enumerate(seeds)
+        ]
 
 
 def uniform_bytes(value: int) -> bool:
@@ -542,6 +554,14 @@ def find_tables(
                 continue
             stack = int.from_bytes(data[offset : offset + 4], byte_order)
             if not plausible_stack_pointer(stack, classify):
+                offset += alignment
+                continue
+
+            # VTOR ignores the low seven bits and an image's base is at
+            # least that aligned, so a table cannot sit at an offset like
+            # this. Rejected outright rather than carried as a weak image:
+            # a hard architectural requirement is not a matter of degree.
+            if (segment.image_offset + offset) % VTOR_ALIGNMENT:
                 offset += alignment
                 continue
 

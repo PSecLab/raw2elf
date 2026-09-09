@@ -260,12 +260,19 @@ class ImageDiscovery(AnalysisPass):
                 image.size,
             )
             end = self._trim(offset, following, padding)
+            # Each image's base comes from its own entry structure, so every
+            # field below describes the same image.
+            seeds = candidate.details.get("base_seeds") or ()
+            own_base = seeds[0][0] if seeds else None
             hypotheses.append(
                 ImageHypothesis(
                     architecture=context.backend.name,
                     image_offset=offset,
                     image_size=max(end - offset, 0),
+                    runtime_base=own_base,
                     entry=candidate.entry_value,
+                    entry_structure=None if own_base is None else own_base + offset,
+                    initial_stack_pointer=candidate.details.get("initial_sp"),
                     score=candidate.details.get("score", 0.0),
                     confidence=candidate.confidence,
                     evidence=list(candidate.evidence),
