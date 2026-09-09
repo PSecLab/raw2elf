@@ -100,6 +100,27 @@ class Reference:
     #: Accesses from several independently reached functions are much better
     #: evidence than the same number of accesses from one block.
     source_function: Optional[int] = None
+    #: Whether the value this address was *built from* is credible as a
+    #: memory base. An instruction can be perfectly reachable, correctly
+    #: decoded, and still compute a meaningless address, because the base
+    #: register held something that was never a pointer -- a loop counter, a
+    #: flag, a function argument the analysis could not resolve. The
+    #: effective address is then just the displacement wearing a base's
+    #: clothes, and it is not evidence about memory.
+    base_credible: bool = True
+
+    @property
+    def establishes_memory(self) -> bool:
+        """Whether this reference is evidence that its address is real memory.
+
+        Three independent things have to hold, and they are genuinely
+        different questions:
+
+        - the instruction is reached (``trusted``),
+        - the address it computed means something (``base_credible``),
+        - and it actually touched that address (``access.touches_memory``).
+        """
+        return self.trusted and self.base_credible and self.access.touches_memory
 
     @property
     def trusted(self) -> bool:
@@ -129,6 +150,7 @@ class Reference:
             "confidence": round(self.confidence, 3),
             "code_provenance": self.code_provenance.value,
             "source_function": hexs(self.source_function, 8),
+            "base_credible": self.base_credible,
         }
 
 
@@ -159,6 +181,10 @@ class ReferenceSet:
     def trusted_accesses(self) -> list[Reference]:
         """Accesses made by code something is known to reach."""
         return [ref for ref in self.accesses() if ref.trusted]
+
+    def establishing(self) -> list[Reference]:
+        """References that are evidence their address is real memory."""
+        return [ref for ref in self._references if ref.establishes_memory]
 
     def counts_by_provenance(self) -> dict[str, int]:
         counts: dict[str, int] = {}

@@ -283,6 +283,16 @@ how much they are trusted, so a function the reset path reaches is recorded as
 reset-reachable even when a sweep also happened to guess it. No re-labelling
 pass is needed.
 
+The trust unit is the **instruction**, not the address interval its function
+happens to span. A function's first and last instruction can be thousands of
+bytes apart with a literal pool in between, and nothing in that gap is reachable
+merely for being inside it. So decoding proceeds block by block and a block
+ends at every unconditional branch, every return (`bx lr`, `pop {…, pc}`), every
+table branch, every undefined instruction, and **every other write to PC** —
+falling out of a block into the bytes that follow it is exactly how a literal
+pool acquires the reachability of the code in front of it. Conditional branches
+contribute both successors; unresolved indirect branches contribute none.
+
 The console reports what this excluded, so nothing disappears silently:
 
 ```
@@ -296,6 +306,72 @@ Recovered:
 
 Those 3105 accesses are real decodings of real bytes. They are not evidence
 that the addresses they compute exist.
+
+### Why do we believe this instruction executes?
+
+Provenance is only useful if a wrong answer can be followed back to the step
+that was wrong. So for every reference that establishes memory, the chain of
+reasoning is recoverable, and it is the chain the analysis actually followed —
+each function records the call site that reached it:
+
+```
+Why those regions are believed:
+  mmio2 0x52002000:
+      entry point -> 0x08020de8
+      direct call at 0x08020e58 -> function 0x08182a6c
+      direct call at 0x08182c06 -> function 0x08184ea0
+      block 0x08184ea0
+      instruction 0x08184fbc  str r3, [r1]
+      accesses 0x52002000
+```
+
+Every established region carries one (`trust_path` in the manifest, shown under
+`-v` and by `why trusted` in the session). A region that cannot produce one is
+not established, whatever its score.
+
+This is also how the class of false positive below was diagnosed rather than
+guessed at.
+
+## A reachable instruction can still compute a nonsense address
+
+Three things are commonly conflated, and they are genuinely different claims:
+
+    reachable instruction  ≠  correct recovered address  ≠  physical memory
+
+An instruction can be perfectly reachable, correctly decoded, and still compute
+an address that means nothing — because the register it indexed held something
+that was never a pointer. From a real STM32G dump:
+
+| recovered address | base register | instruction |
+| --- | --- | --- |
+| `0x00000022` | `0x00000002` | `str r0, [r4, #0x20]` |
+| `0x00000062` | `0x00000002` | `str r1, [r4, #0x60]` |
+| `0x00000529` | `0x00000001` | `strh.w r5, [sb, #0x528]` |
+| `0x00000000` | `0x00000000` | `str r1, [r2]` |
+
+These clustered into a RAM region at `0x00000000`. The trust path shows why
+provenance alone could not reject them:
+
+```
+vector[184] -> handler 0x08024b3c
+direct call at 0x08024b4c -> function 0x0802448c
+   ... nine more direct calls ...
+block 0x0818b2d2
+instruction 0x0818b2d4  str r1, [r2]
+accesses 0x00000000
+...but the base register held 0x0, which cannot address memory
+```
+
+The instruction really is reached, through eleven direct calls from an interrupt
+vector. It really does store. The *address* is a displacement wearing a base's
+clothes, because value propagation resolved the base register to a loop counter
+or a flag.
+
+So a reference records `base_credible` alongside its provenance, and
+`establishes_memory` requires all three claims independently: the instruction is
+reached, the address it computed means something, and it actually touched that
+address. The backend judges the base — the neutral core does not know which
+values could address memory on which target.
 
 ## Memory regions
 
@@ -355,19 +431,35 @@ established threshold, the region is reported and marked **speculative**:
 visible in the console and in the manifest under `speculative_regions`, so
 nothing is silently discarded, but not treated as recovered memory.
 
-A region is **established** only when three things hold at once:
+A region is **established** only when four things hold at once:
 
 - reached code made the accesses (or a startup boundary anchors the range),
-- there is enough of that evidence, and
+- there is enough of that evidence,
+- it can produce a trust path, and
 - the target plausibly has memory there.
 
-Any one of them missing leaves the region reported but speculative. The third
-is the backend's judgement, not the core's: the neutral code asks the backend
-how plausible memory is at an address and never knows the answer itself. On
-Cortex-M, on-chip SRAM and the peripheral windows score full marks, while the
-external RAM and external device windows — which need a memory controller
-configured before they respond at all, and which is where stray constants most
-often land — are held to a much higher bar.
+Any one of them missing leaves the region reported but speculative.
+
+Plausibility is the backend's judgement, not the core's: the neutral code asks
+how plausible memory is at an address and never knows the answer itself. The
+question is asked *about writable memory* for a RAM region, because the answer
+differs by range — a window that plausibly holds image bytes is not therefore a
+plausible place to find a RAM bank. On Cortex-M, on-chip SRAM and the peripheral
+windows score full marks; the external RAM and external device windows, which
+need a memory controller configured before they respond, are held to a much
+higher bar; and a *writable* region in the code window needs the part to be
+known, because although a few parts alias SRAM there (CCM on STM32F4, the main
+SRAM on LPC17xx), the window itself is flash and boot ROM.
+
+Where the analyst names a part, its documented RAM origins answer that question
+directly: device knowledge beats architectural guesswork, so a CCM bank is
+established on a part known to have one and stays speculative otherwise.
+
+Implausibility withholds the *claim*, not the evidence. It does not reduce a
+region's score, because the two are separate questions — how sure we are these
+accesses happened, and whether this target is known to have memory where they
+point. Subtracting would push a well-evidenced bank below the reporting floor
+and lose it, when what is wanted is to report it and withhold the claim.
 
 Neither kind is inserted into the ELF. RAM and MMIO regions are analysis
 output; the ELF's `PT_LOAD` segments come from the image bytes and from the
@@ -575,16 +667,40 @@ A selected image is analysed in its own right and inherits no conclusion drawn
 in the enclosing dump's coordinate system — offsets restart at zero, and the
 file offset it came from is kept for reporting.
 
-### Every recovered fact describes one image
+### One image is selected, never assembled
 
 Base, entry, entry structure, initial stack pointer and extent only mean
-anything together, so they are not passed around separately. One type,
-`ImagePlacement`, holds all of them, and every later stage — entry selection,
-memory mapping, symbol emission, ELF construction — works from one selected
-placement. Mixing a base recovered from one image with an entry recovered from
-another produces a result in which every individual number looks reasonable and
-the combination describes no image that exists; the type is what makes that
-assembly happen in one place instead of implicitly in five.
+anything together. The rule is therefore not "hold them in one type" but
+something stronger:
+
+> Nothing in the pipeline may *build* an image. Image discovery produces
+> candidates, each already internally consistent; one of those objects is
+> selected, and every later stage reads it.
+
+Selecting the best base, the best entry, the best stack pointer and the best
+extent independently and combining them is how a dump of a bootloader and an
+application produces a tuple in which every number is defensible and the
+combination describes no image that exists. Holding the parts in one struct
+does not prevent that — it only makes it tidier.
+
+So `ImageHypothesis` wraps an `ImagePlacement`, and the only operations on it
+move the whole object at once: `rebased`, `at_image_offset`, `with_entry`,
+`grown_to_contain`. `BaseRecovery` chooses one candidate — the one whose entry
+structure produced the selected entry — and publishes it as `selected_image`.
+`runtime_base`, `program_base` and `entry` are then *derived from* it rather
+than standing alongside it, so a later pass has nothing else to agree with.
+
+Two details of that are worth stating, because getting them wrong is subtle:
+
+**An entry structure is stored as an offset, not an address.** It sits at a
+fixed position within the image, so its address follows from the base. Storing
+the address means it can go stale the moment the base is corrected.
+
+**Rebasing corrects a belief; it does not relocate.** When base scoring settles
+on a different address than the candidate was built with, the whole image moves
+— but the entry point was *read out of the entry structure*, and is what the
+bytes actually say, so it does not move with it. (An earlier version shifted it
+too, which silently moved ChibiOS's entry from `0x080002b8` to `0x080000b8`.)
 
 It also holds all three coordinate systems at once, because confusing them is
 the other half of the same failure:
@@ -639,6 +755,46 @@ scattered through an image, but the nearest one is close, because code starts
 right after the vector table. A base that leaves even the nearest handler a
 long way past its own table has usually put that table where some other image's
 table belongs, and is penalized heavily.
+
+### The ELF is the selected image, or there is no ELF
+
+The emitted ELF describes exactly one image: the selected one. Its `PT_LOAD`
+segments are that image's bytes at that image's base, and its size is that
+image's size.
+
+Before anything is written, a set of assertions compares numbers that must
+agree by construction:
+
+- the published placement *is* the selected image's own object,
+- the entry structure lies inside the selected image,
+- the entry point is the selected image's, and lies inside it,
+- every emitted segment lies inside it, and no more bytes are emitted than it
+  contains,
+- the reported file offset is the one the selected image was found at.
+
+A failure raises `InconsistentPlacementError` and **no ELF is written**. This
+is deliberately not a warning. An ELF assembled from one image's base and
+another's extent loads, disassembles, and is wrong in a way nothing downstream
+can detect; a missing file is a better outcome than that.
+
+These assertions guard against the tool's own mistakes, so an analyst-supplied
+`--base` or `--entry` relaxes them: knowingly contradicting what the image says
+about itself is a legitimate thing to do, and produces a warning instead.
+
+When a dump holds more than one program and none was selected explicitly, the
+run says which one it reconstructed and how to ask for the other:
+
+```
+Warnings:
+  - this input holds 2 programs; reconstructing the one at file offset 0x000000
+    (39792 bytes). The other(s) are at 0x020000 (1769248 bytes) -- use --image
+    to select one
+```
+
+A container that declares its own layout — Intel HEX, SREC — is not a dump with
+programs hidden in it, so nothing is carved out of one: every segment it
+declares is part of the program, and the assertions check each segment against
+its own declared address instead.
 
 ### The program is not always the whole input
 

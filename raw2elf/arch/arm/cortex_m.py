@@ -69,6 +69,17 @@ _REGION_PLAUSIBILITY: tuple[tuple[int, int, float], ...] = (
     (0xE0100000, 0x100000000, 0.0),   # reserved by the architecture
 )
 
+#: End of the architectural code region.  Flash, the boot ROM and their
+#: aliases live below this; SRAM normally does not.
+_CODE_WINDOW_END = 0x20000000
+#: How far past a vendor SRAM origin in the code region still counts as it.
+_ALIAS_WINDOW = 0x00100000
+#: Plausibility of a *writable* region in the code window on an unknown part.
+_UNBACKED_CODE_WINDOW_RAM = 0.2
+#: No Cortex-M part addresses memory this low.  The vector table lives at the
+#: bottom of the code region, so a base below it is not a pointer at all.
+_SMALLEST_BASE = 0x400
+
 #: Ranges the image itself can plausibly be linked into.
 _EXECUTION_WINDOWS: tuple[tuple[int, int], ...] = (
     (0x00000000, 0x1FFFFFFF),
@@ -145,12 +156,40 @@ class CortexMBackend(ArchitectureBackend):
                 return kind
         return AddressClass.UNKNOWN
 
-    def region_plausibility(self, address: int) -> float:
+    def region_plausibility(
+        self, address: int, writable: bool = False, known_ram: tuple[int, ...] = ()
+    ) -> float:
         address &= 0xFFFFFFFF
-        for low, high, weight in _REGION_PLAUSIBILITY:
+        weight = 0.0
+        for low, high, value in _REGION_PLAUSIBILITY:
             if low <= address < high:
-                return weight
-        return 0.0
+                weight = value
+                break
+        if writable and address < _CODE_WINDOW_END:
+            # The code region holds flash, the boot ROM and their aliases.
+            # A few parts do alias SRAM into it -- CCM on STM32F4, the main
+            # SRAM on LPC17xx -- but only specific ones, so a RAM bank here
+            # needs the part to be known rather than the window to allow it.
+            aliased = any(
+                origin <= address < origin + _ALIAS_WINDOW
+                for origin in known_ram
+                if origin < _CODE_WINDOW_END
+            )
+            if not aliased:
+                weight = min(weight, _UNBACKED_CODE_WINDOW_RAM)
+        return weight
+
+    def is_credible_base(self, value: int) -> bool:
+        """Whether ``value`` could address memory on a Cortex-M part.
+
+        The failure this catches: a reached store indexing a register that
+        held a loop counter or a flag. ``str r0, [r4, #0x20]`` with ``r4 == 2``
+        yields "address 0x22", which is a displacement, not a pointer.
+        """
+        value &= 0xFFFFFFFF
+        if value < _SMALLEST_BASE:
+            return False
+        return self.region_plausibility(value) > 0.0
 
     def normalize_code_pointer(self, value: int) -> int:
         """Drop the Thumb interworking bit."""
@@ -1008,6 +1047,69 @@ class CortexMBackend(ArchitectureBackend):
             return ReferenceKind.CODE
         return ReferenceKind.FLASH_DATA
 
+    def trust_path(self, context, reference) -> list[str]:
+        recovery = self._recovery(context)
+        graph = recovery.graph
+        if graph is None or reference.source_function is None:
+            return []
+
+        # Walk back up the discovery edges to a seed. Each function records
+        # the call site that reached it, so the chain is the one the analysis
+        # actually followed rather than a plausible-looking reconstruction.
+        chain: list = []
+        start = reference.source_function
+        seen: set[int] = set()
+        while start is not None and start not in seen:
+            seen.add(start)
+            function = graph.functions.get(start)
+            if function is None:
+                break
+            chain.append(function)
+            start = None if function.reached_from is None else function.reached_from[0]
+
+        steps: list[str] = []
+        origin = chain[-1] if chain else None
+        if origin is not None:
+            label = origin.provenance.value.lower().replace("_", " ")
+            if origin.provenance is CodeProvenance.DECLARED_HANDLER:
+                index = self._vector_index(context, origin.start)
+                where = f"vector[{index}]" if index is not None else "an exception vector"
+                steps.append(f"{where} -> handler {origin.start:#010x}")
+            else:
+                steps.append(f"{label} -> {origin.start:#010x}")
+
+        for function in reversed(chain[:-1]):
+            site = function.reached_from[1] if function.reached_from else None
+            if site is not None:
+                steps.append(f"direct call at {site:#010x} -> function {function.start:#010x}")
+            else:
+                steps.append(f"function {function.start:#010x}")
+
+        owner = graph.functions.get(reference.source_function)
+        block = owner.block_of(reference.source_offset) if owner else None
+        if block is not None:
+            steps.append(f"block {block:#010x}")
+        steps.append(f"instruction {reference.source_offset:#010x}  {reference.source_text}")
+        verb = "accesses" if reference.access.touches_memory else "computes"
+        steps.append(f"{verb} {reference.value:#010x}")
+        if not reference.base_credible:
+            steps.append(
+                f"...but the base register held {reference.base_value:#x}, "
+                "which cannot address memory"
+            )
+        return steps
+
+    def _vector_index(self, context, handler: int) -> Optional[int]:
+        """Which vector points at ``handler``, if one does."""
+        selected = context.get("selected_entry_candidate")
+        table = selected.details.get("table") if selected is not None else None
+        if table is None:
+            return None
+        for slot in table.handler_slots:
+            if self.normalize_code_pointer(table.words[slot]) == handler:
+                return slot
+        return None
+
     def discover_code(self, context) -> list[tuple[int, int]]:
         return list(self._recovery(context).code_regions)
 
@@ -1041,6 +1143,13 @@ class CortexMBackend(ArchitectureBackend):
         ]
         if not system:
             return []
+        # This region is claimed because instructions reached it, so it owes
+        # the same account of itself as any other: which instruction, and why
+        # that instruction is believed to execute.
+        witnesses = [item for item in system if item.establishes_memory]
+        if not witnesses:
+            return []
+        witness = min(witnesses, key=lambda item: item.code_provenance.rank)
         return [
             MemoryRegion(
                 kind=RegionKind.MMIO,
@@ -1049,6 +1158,7 @@ class CortexMBackend(ArchitectureBackend):
                 name="ppb",
                 writable=True,
                 confidence=0.9,
+                trust_path=tuple(self.trust_path(context, witness)),
                 evidence=(
                     Evidence(
                         kind="mmio_access",

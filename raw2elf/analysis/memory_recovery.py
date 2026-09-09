@@ -68,7 +68,8 @@ class AccessEvidence:
     decoded say the bytes decoded.
     """
 
-    #: Addresses reached by code something is known to reach.
+    #: Addresses reached by code something is known to reach, by an access
+    #: whose base value could actually address memory.
     trusted_addresses: set = field(default_factory=set)
     #: Instruction offsets in trusted code that reached them.
     trusted_sites: set = field(default_factory=set)
@@ -81,15 +82,28 @@ class AccessEvidence:
     #: Summed weight of the untrusted accesses, before the ceiling.
     untrusted_weight: float = 0.0
     untrusted_sites: set = field(default_factory=set)
+    #: Instruction offsets whose recovered address was built from a value
+    #: that could not address memory.
+    incredible_sites: set = field(default_factory=set)
     #: The best reason any contributing instruction is believed to be code.
     best_provenance: Optional[CodeProvenance] = None
+    #: The strongest reference that establishes memory here, kept so the
+    #: region can show why it is believed rather than only assert it.
+    witness: Optional[object] = None
 
     def record(self, reference) -> None:
         self.addresses.add(reference.value)
         provenance = reference.code_provenance
         if self.best_provenance is None or provenance.rank < self.best_provenance.rank:
             self.best_provenance = provenance
+        if not reference.base_credible:
+            # Reached, decoded, and computing nothing. Counted as weak so it
+            # is visible, never as support.
+            self.incredible_sites.add(reference.source_offset)
+            return
         if reference.trusted:
+            if self.witness is None or provenance.rank < self.witness.code_provenance.rank:
+                self.witness = reference
             self.trusted_addresses.add(reference.value)
             self.trusted_sites.add(reference.source_offset)
             if reference.source_function is not None:
@@ -110,6 +124,7 @@ class AccessEvidence:
             addresses=self.addresses & addresses,
             untrusted_weight=self.untrusted_weight,
             untrusted_sites=set(self.untrusted_sites),
+            incredible_sites=set(self.incredible_sites),
             best_provenance=self.best_provenance,
         )
 
@@ -231,20 +246,38 @@ def _region_confidence(
             )
         )
 
-    if plausibility < PLAUSIBLE_ENOUGH:
-        # Not a veto -- the evidence is still reported -- but this range needs
-        # a memory controller configured before it answers at all, so it takes
-        # much more than a few accesses to believe.
-        score -= 2.0
+    if evidence.incredible_sites:
         notes.append(
             Evidence(
                 kind="region",
                 source="MemoryRegionRecovery",
                 explanation=(
-                    "this window needs external memory to have been configured before it "
-                    "responds, which the firmware was not seen to do"
+                    f"{len(evidence.incredible_sites)} access(es) reach this range only by "
+                    "indexing a register whose recovered value could not address memory, so "
+                    "the address is a displacement rather than a pointer"
                 ),
-                weight=2.0,
+                value=len(evidence.incredible_sites),
+                supports=False,
+            )
+        )
+
+    if plausibility < PLAUSIBLE_ENOUGH:
+        # This keeps the region speculative -- see the establishment test in
+        # MemoryRegionRecovery._region -- rather than reducing its score. The
+        # two are different questions: the score says how sure we are these
+        # accesses happened, and establishment says whether this target is
+        # known to have memory where they point. Subtracting here would push
+        # a well-evidenced bank below the reporting floor and lose it, when
+        # what is wanted is to report it and withhold the claim.
+        notes.append(
+            Evidence(
+                kind="region",
+                source="MemoryRegionRecovery",
+                explanation=(
+                    "this target is not known to have memory in this window, so the region "
+                    "is reported without being claimed as recovered"
+                ),
+                weight=0.0,
                 supports=False,
             )
         )
@@ -524,6 +557,12 @@ class MemoryRegionRecovery(AnalysisPass):
             combined.addresses |= item.addresses
             combined.untrusted_weight += item.untrusted_weight
             combined.untrusted_sites |= item.untrusted_sites
+            combined.incredible_sites |= item.incredible_sites
+            if item.witness is not None and (
+                combined.witness is None
+                or item.witness.code_provenance.rank < combined.witness.code_provenance.rank
+            ):
+                combined.witness = item.witness
             if item.best_provenance is not None and (
                 combined.best_provenance is None
                 or item.best_provenance.rank < combined.best_provenance.rank
@@ -531,9 +570,19 @@ class MemoryRegionRecovery(AnalysisPass):
                 combined.best_provenance = item.best_provenance
 
         # How likely this target is to have memory here at all. The backend
-        # knows its own address map; this code does not and must not.
+        # knows its own address map; this code does not and must not. The
+        # question is asked about read/write memory for RAM, because a window
+        # that plausibly holds image bytes is not therefore a plausible place
+        # to find a RAM bank.
+        layout = layout_for(context.options.mcu) if context.options.mcu else None
+        known_ram = tuple(layout.ram) if layout else ()
         plausibility = min(
-            (context.backend.region_plausibility(address) for address in members),
+            (
+                context.backend.region_plausibility(
+                    address, writable=kind is RegionKind.RAM, known_ram=known_ram
+                )
+                for address in members
+            ),
             default=0.5,
         )
         confidence, notes = _region_confidence(
@@ -555,6 +604,15 @@ class MemoryRegionRecovery(AnalysisPass):
             and (anchored or bool(combined.trusted_sites))
             and plausibility >= PLAUSIBLE_ENOUGH
         )
+        # An established region must be able to answer "why do we believe an
+        # instruction that touches this executes?". If it cannot, it is not
+        # established, whatever its score.
+        trust_path: tuple[str, ...] = ()
+        if combined.witness is not None:
+            trust_path = tuple(context.backend.trust_path(context, combined.witness))
+        if established and not anchored and not trust_path:
+            established = False
+
         evidence: list[Evidence] = list(notes)
         for items in (extra or {}).values():
             evidence.extend(items)
@@ -566,6 +624,7 @@ class MemoryRegionRecovery(AnalysisPass):
             writable=True,
             confidence=confidence,
             speculative=not established,
+            trust_path=trust_path,
             evidence=tuple(evidence[:6]),
         )
 
@@ -585,16 +644,54 @@ class MemoryRegionRecovery(AnalysisPass):
         trim = bool(context.options.extra.get("trim_padding", True))
         placement = context.get("selected_placement")
 
+        # Clipping applies to a dump with a program inside it, not to a
+        # container that declares its own layout: every segment an Intel HEX
+        # file describes is part of the program.
+        clips = (
+            placement is not None
+            and placement.image_size
+            and len(context.image.segments) == 1
+            and not context.image.addresses_declared
+        )
+
         for segment in context.image.iter_segments():
             data = segment.data
             image_offset = segment.image_offset
-            if placement is not None and placement.image_offset > 0:
+            if clips:
+                # The bytes that reach the ELF are the selected image's. A
+                # dump may hold erased flash, a configuration block or a
+                # second program; emitting those as part of this one places
+                # it at an address it does not occupy.
                 low = max(image_offset, placement.image_offset)
                 high = min(segment.image_end, placement.image_offset + placement.image_size)
                 if low >= high:
                     continue
+                dropped = (high - low) - segment.size
                 data = data[low - image_offset : high - image_offset]
                 image_offset = low
+                if dropped:
+                    erased = any(
+                        run.image_offset <= high and run.end >= segment.image_end
+                        for run in padding
+                    )
+                    what = (
+                        "trailing erased flash"
+                        if erased
+                        else "bytes outside the selected image"
+                    )
+                    context.note(
+                        Evidence(
+                            kind="image_extent",
+                            source=self.name,
+                            explanation=(
+                                f"omitted {human_size(-dropped)} of {what} from the ELF "
+                                f"(kept offsets {low:#x}..{high:#x} of "
+                                f"{segment.image_offset:#x}..{segment.image_end:#x})"
+                            ),
+                            value=-dropped,
+                            weight=0.0,
+                        )
+                    )
             address = segment.address
             if address is None:
                 address = context.runtime_base + image_offset

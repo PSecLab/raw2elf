@@ -87,15 +87,43 @@ def test_a_placement_converts_between_all_three_coordinate_systems():
 def test_a_placement_knows_when_its_parts_disagree():
     coherent = ImagePlacement(
         file_offset=0, image_offset=0, runtime_base=0x08000000, image_size=0x1000,
-        entry_structure=0x08000000, entry=0x08000300,
+        entry_structure_offset=0, entry=0x08000300,
     )
     assert coherent.consistent
+    assert coherent.entry_structure == 0x08000000
     # An entry belonging to the *next* image along.
     mixed = ImagePlacement(
         file_offset=0, image_offset=0, runtime_base=0x08000000, image_size=0x1000,
-        entry_structure=0x08000000, entry=0x08020DE8,
+        entry_structure_offset=0, entry=0x08020DE8,
     )
     assert not mixed.consistent
+
+
+def test_the_entry_structure_address_follows_the_base():
+    """Stored as an offset, so it cannot go stale when the image moves."""
+    placement = ImagePlacement(
+        file_offset=0, image_offset=0, runtime_base=0x08000200, image_size=0x1000,
+        entry_structure_offset=0, entry=0x080002B8,
+    )
+    assert placement.entry_structure == 0x08000200
+
+    # Correcting the belief about where the image loads moves the structure
+    # with it, and leaves the entry -- which was read out of that structure,
+    # and is what the bytes actually say -- alone.
+    corrected = placement.rebased(0x08000000)
+    assert corrected.entry_structure == 0x08000000
+    assert corrected.entry == 0x080002B8
+
+
+def test_carving_shifts_every_offset_together():
+    placement = ImagePlacement(
+        file_offset=0x20000, image_offset=0x20000, runtime_base=0x08020000,
+        image_size=0x1000, entry_structure_offset=0x20000, entry=0x08020DE8,
+    )
+    carved = placement.at_image_offset(0)
+    assert carved.entry_structure_offset == 0
+    assert carved.entry_structure == 0x08020000, "unchanged address"
+    assert carved.file_offset == 0x20000, "still found there in the analyst's file"
 
 
 # -- one program, stored somewhere other than the start --------------------

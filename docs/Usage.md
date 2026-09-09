@@ -157,6 +157,26 @@ Those decodings are real; they are not evidence that the addresses they compute
 exist, and they establish no memory regions. See
 [A decoded instruction is not executed code](Recovery.md#a-decoded-instruction-is-not-executed-code).
 
+**The ELF describes one program.** A dump holding a bootloader and an
+application reconstructs one of them, says which, and says how to get the other:
+
+```
+$ raw2elf stm32G.bin -o boot.elf
+Warnings:
+  - this input holds 2 programs; reconstructing the one at file offset 0x000000
+    (39792 bytes). The other(s) are at 0x020000 (1769248 bytes) -- use --image
+    to select one
+
+$ raw2elf stm32G.bin --image 1 -o app.elf
+Entry structure:    vector_table at file offset 0x020000 (0x000000 within the selected image)
+Load base:          0x08020000
+Entry point:        0x08020de8  (ELF e_entry 0x08020de9)
+```
+
+If the numbers describing the selected image ever contradict each other, no ELF
+is written at all — see
+[The ELF is the selected image](Recovery.md#the-elf-is-the-selected-image-or-there-is-no-elf).
+
 **The MCU is two families, not a part number.** AT32F4 and STM32F4 are
 register-compatible, so from these accesses the part genuinely cannot be
 narrowed further, and saying otherwise would be false precision.

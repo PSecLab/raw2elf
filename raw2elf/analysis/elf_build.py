@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import Optional
 
 from ..core.evidence import Evidence
+from ..core.hypothesis import InconsistentPlacementError
 from ..core.memory import InitKind, LoadedSegment, StartupState
 from ..core.pipeline import AnalysisContext, AnalysisPass
 from ..core.util import human_size
@@ -46,7 +47,106 @@ class ElfReconstruction(AnalysisPass):
     provides = frozenset({"elf", "elf_sections"})
     optional = False
 
+    def _check_placement(self, context: AnalysisContext) -> None:
+        """Refuse to write an ELF whose own description contradicts itself.
+
+        These are assertions, not scores. Each one compares two numbers that
+        must agree by construction, so a disagreement means a stage assembled
+        an image out of parts rather than selecting one -- and the resulting
+        ELF would load, disassemble, and be wrong.
+        """
+        selected = context.get("selected_image")
+        placement = context.get("selected_placement")
+        if selected is None or placement is None:
+            return
+
+        # These assertions catch *our* mistakes -- an image assembled out of
+        # parts. An analyst who supplies --base or --entry may knowingly
+        # contradict what the image says about itself, which is their call;
+        # that is reported as a warning rather than refused.
+        forced = context.options.base is not None or context.options.entry is not None
+
+        problems: list[str] = []
+        if placement is not selected.placement:
+            problems.append("the reported placement is not the selected image's own")
+
+        base = placement.runtime_base
+        if base is None:
+            problems.append("the selected image has no load address")
+        else:
+            structure = placement.entry_structure
+            if structure is not None and not placement.contains_address(structure):
+                problems.append(
+                    f"the entry structure {structure:#010x} is outside the selected image "
+                    f"{base:#010x}..{placement.runtime_end:#010x}"
+                )
+            entry = context.get("entry")
+            if (
+                entry is not None
+                and placement.entry is not None
+                and context.backend.normalize_code_pointer(entry)
+                != context.backend.normalize_code_pointer(placement.entry)
+            ):
+                problems.append(
+                    f"the entry point {entry:#010x} is not the selected image's "
+                    f"{placement.entry:#010x}"
+                )
+            if entry is not None and not placement.contains_address(
+                context.backend.normalize_code_pointer(entry)
+            ):
+                complaint = (
+                    f"the entry point {entry:#010x} is outside the selected image "
+                    f"{base:#010x}..{placement.runtime_end:#010x}"
+                )
+                if forced:
+                    context.warn(
+                        complaint + "; the supplied base or entry disagrees with what the "
+                        "image says about itself"
+                    )
+                else:
+                    problems.append(complaint)
+
+            segments = context.get("loadable_segments") or []
+            # A container that declares its own layout describes discontiguous
+            # memory on purpose, so its segments are checked against their
+            # own declarations rather than against one contiguous extent.
+            contiguous = (
+                len(context.image.segments) == 1 and not context.image.addresses_declared
+            )
+            if contiguous:
+                for segment in segments:
+                    end = segment.address + segment.size
+                    if forced:
+                        continue
+                    if segment.address < base or end > placement.runtime_end:
+                        problems.append(
+                            f"segment {segment.name} at {segment.address:#010x}..{end:#010x} "
+                            f"is not inside the selected image "
+                            f"{base:#010x}..{placement.runtime_end:#010x}"
+                        )
+                emitted = sum(segment.size for segment in segments)
+                if not forced and emitted > placement.image_size:
+                    problems.append(
+                        f"{emitted} bytes would be emitted for an image of "
+                        f"{placement.image_size}"
+                    )
+            else:
+                for segment in segments:
+                    declared = context.image.declared_address_for(segment.image_offset)
+                    if declared is not None and declared != segment.address:
+                        problems.append(
+                            f"segment {segment.name} would be written at "
+                            f"{segment.address:#010x}, but the input declares "
+                            f"{declared:#010x}"
+                        )
+            if placement.file_offset != context.file_offset_of(placement.image_offset):
+                problems.append("the file offset does not describe the selected image")
+
+        if problems:
+            raise InconsistentPlacementError(problems)
+
     def run(self, context: AnalysisContext) -> None:
+        self._check_placement(context)
         backend = context.backend
         target = backend.elf_target_info()
         entry = context.get("entry")

@@ -52,13 +52,25 @@ class ImagePlacement:
     #: Runtime address of the image's first byte.
     runtime_base: Optional[int] = None
     image_size: int = 0
-    #: Runtime address of the structure the entry point was recovered from.
-    entry_structure: Optional[int] = None
-    #: Runtime address where execution begins.
+    #: Image offset of the structure the entry point was recovered from.
+    #: Stored as an offset rather than an address so that it cannot go stale
+    #: when the image is placed somewhere else: the structure is at a fixed
+    #: position *within* the image, and its address follows from the base.
+    entry_structure_offset: Optional[int] = None
+    #: Runtime address where execution begins, as read out of the image.
     entry: Optional[int] = None
     #: Reset-time stack pointer, for architectures that have one.
     initial_stack_pointer: Optional[int] = None
     confidence: float = 0.0
+
+    # -- derived ----------------------------------------------------------
+
+    @property
+    def entry_structure(self) -> Optional[int]:
+        """Runtime address of the structure the entry point came from."""
+        if self.entry_structure_offset is None:
+            return None
+        return self.address_of(self.entry_structure_offset)
 
     # -- geometry ---------------------------------------------------------
 
@@ -112,19 +124,57 @@ class ImagePlacement:
         return True
 
     def rebased(self, runtime_base: int) -> "ImagePlacement":
-        """The same image placed at a different runtime base.
+        """The same image, now believed to load at ``runtime_base``.
 
-        Facts expressed as runtime addresses move with it; facts recovered
-        from the bytes themselves, such as the initial stack pointer, do not.
+        This corrects a belief about where the image already lives; it does
+        not relocate it.  So facts read out of the bytes -- the entry point
+        recovered from an entry structure, the reset-time stack pointer --
+        are unchanged, while positions expressed relative to the image, such
+        as where its entry structure sits, follow the new base.
+        """
+        return replace(self, runtime_base=runtime_base)
+
+    def with_entry(self, entry: Optional[int]) -> "ImagePlacement":
+        """The same image with an authoritative entry point applied.
+
+        Used when the analyst supplies ``--entry``: they know something the
+        bytes do not say, and the rest of the image is unaffected.
+        """
+        return replace(self, entry=entry)
+
+    def grown_to_contain(self, *addresses: Optional[int]) -> "ImagePlacement":
+        """The same image, extended so its own facts fall inside it.
+
+        An image's extent is inferred -- from where the next program starts,
+        or where erased flash begins -- while its entry is read directly out
+        of its own entry structure.  When the two disagree, the extent is
+        what was guessed, so it gives way.  An image contains the code its
+        own reset vector points at.
         """
         if self.runtime_base is None:
-            return replace(self, runtime_base=runtime_base)
-        shift = runtime_base - self.runtime_base
+            return self
+        end = self.runtime_base + self.image_size
+        for address in addresses:
+            if address is not None and self.runtime_base <= address:
+                end = max(end, address + 1)
+        return replace(self, image_size=end - self.runtime_base)
+
+    def at_image_offset(self, image_offset: int) -> "ImagePlacement":
+        """The same image, described in another image-offset coordinate system.
+
+        Carving an image out of a dump restarts offsets at zero. The bytes,
+        the file they came from and the address they load at are unchanged,
+        so every offset shifts by the same amount and nothing else moves.
+        """
+        shift = image_offset - self.image_offset
         return replace(
             self,
-            runtime_base=runtime_base,
-            entry_structure=None if self.entry_structure is None else self.entry_structure + shift,
-            entry=None if self.entry is None else self.entry + shift,
+            image_offset=image_offset,
+            entry_structure_offset=(
+                None
+                if self.entry_structure_offset is None
+                else self.entry_structure_offset + shift
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -134,6 +184,7 @@ class ImagePlacement:
             "image_size": self.image_size,
             "runtime_base": hexs(self.runtime_base, 8),
             "entry_structure": hexs(self.entry_structure, 8),
+            "entry_structure_offset": hexs(self.entry_structure_offset, 6),
             "entry": hexs(self.entry, 8),
             "initial_stack_pointer": hexs(self.initial_stack_pointer, 8),
             "confidence": round(self.confidence, 3),

@@ -256,7 +256,9 @@ class ArchitectureBackend(ABC):
         """What the architecture's address map reserves ``address`` for."""
         return AddressClass.UNKNOWN
 
-    def region_plausibility(self, address: int) -> float:
+    def region_plausibility(
+        self, address: int, writable: bool = False, known_ram: tuple[int, ...] = ()
+    ) -> float:
         """How plausible it is that this target has memory at ``address``.
 
         Distinct from :meth:`classify_address`, which says what the address
@@ -266,9 +268,43 @@ class ArchitectureBackend(ABC):
         to be real memory than one in on-chip SRAM, and evidence for a region
         there should have to be correspondingly better.
 
+        ``writable`` asks about read/write memory specifically.  The answer
+        differs by range: a window that plausibly holds executable image
+        bytes is not therefore a plausible place to find a RAM bank.
+
+        ``known_ram`` carries the RAM origins of a part the analyst named, so
+        a backend can accept a range its own address map would otherwise
+        doubt.  Device knowledge beats architectural guesswork.
+
         Returns a weight in ``[0, 1]``.  The default abstains.
         """
         return 0.5
+
+    def trust_path(self, context: "AnalysisContext", reference) -> list[str]:
+        """The chain of reasoning that makes ``reference``'s instruction code.
+
+        Answers one question, for one reference: *why do we believe this
+        instruction executes?*  Each step names something concrete -- a seed,
+        a call site, a block -- so a wrong answer can be followed back to the
+        step that was wrong rather than argued about.
+
+        Returns an empty list when the backend cannot say.
+        """
+        return []
+
+    def is_credible_base(self, value: int) -> bool:
+        """Whether ``value`` could be the base of a real memory access.
+
+        A reached, correctly decoded load or store can still compute a
+        meaningless address, because the register it indexed held something
+        that was never a pointer.  The recovered "effective address" is then
+        the displacement plus a small integer, and the only way to tell is to
+        ask whether the base itself could address memory on this target.
+
+        The default accepts anything, which is the conservative answer for a
+        backend that has not been taught its own address map.
+        """
+        return True
 
     def normalize_code_pointer(self, value: int) -> int:
         """Strip any instruction-mode encoding from a code pointer."""

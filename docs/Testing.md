@@ -27,6 +27,7 @@ the package's parent directory on `sys.path`, so the suite runs from anywhere.
 | `test_inference_is_conservative.py` | The ways inference can outrun its evidence — constants not becoming addresses, regions resting on real accesses, contradictions compounding, a candidate not being reported as an identification. |
 | `test_code_provenance.py` | The trust ladder: how it propagates, and that decoded data cannot establish memory however much of it there is. |
 | `test_image_placement.py` | The three coordinate systems, and that a program stored at a non-zero file offset loads and is emitted where it is linked. |
+| `test_one_selected_image.py` | That every way of selecting an image yields one coherent object, that the ELF is that image, and that the consistency assertions refuse rather than warn. |
 | `test_end_to_end.py` | The graded metric matrix over every firmware in every format. |
 
 Tests that need external tools skip cleanly without them. The `objdump` check

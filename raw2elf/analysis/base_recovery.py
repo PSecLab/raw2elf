@@ -25,7 +25,7 @@ import math
 from collections import Counter
 
 from ..core.evidence import Evidence, confidence_label
-from ..core.hypothesis import BaseCandidate, resolve
+from ..core.hypothesis import BaseCandidate, ImageHypothesis, resolve
 from ..core.interaction import Choice
 from ..core.pipeline import AnalysisContext, AnalysisPass
 from ..core.reference import ReferenceSet
@@ -53,7 +53,15 @@ class BaseRecovery(AnalysisPass):
     # backend that cannot recover references should still produce an ELF.
     after = frozenset({"ReferenceRecovery", "EntryDiscovery", "ImageDiscovery"})
     provides = frozenset(
-        {"runtime_base", "base_candidates", "entry", "base_confidence", "selected_placement"}
+        {
+            "runtime_base",
+            "program_base",
+            "base_candidates",
+            "entry",
+            "base_confidence",
+            "selected_image",
+            "selected_placement",
+        }
     )
     optional = False
 
@@ -292,81 +300,169 @@ class BaseRecovery(AnalysisPass):
     # -- entry ------------------------------------------------------------
 
     def _place(self, context: AnalysisContext, base: int) -> None:
-        """Assemble the one placement every later stage works from.
+        """Choose the one image every later stage works from.
 
-        Base, entry, entry structure and stack pointer are recovered by
-        different passes and only mean anything together. Assembling them
-        once, here, is what keeps a later stage from pairing this run's base
-        with some other image's entry.
+        This *selects* an image; it does not build one. Base, entry, entry
+        structure, stack pointer and extent are recovered by different means,
+        and a stage that picks the best of each and combines them produces a
+        tuple in which every number is defensible and which describes no image
+        that exists. So the candidate images -- each already internally
+        consistent -- are the only things offered, one is chosen, and if the
+        recovered base differs from the one it was built with, the whole
+        object moves together.
         """
-        candidate = context.get("selected_entry_candidate")
-        structure = None
-        initial_sp = None
-        start, size = 0, context.image.size
-        if candidate is not None:
-            structure = base + candidate.image_offset
-            initial_sp = candidate.details.get("initial_sp")
-            # The program is the image the entry structure heads, which is
-            # not necessarily the whole input. A dump whose first 128 KiB are
-            # erased is not a program that begins 128 KiB before its own
-            # vector table; treating it as one is what puts a Cortex-M image
-            # at an address no Cortex-M part has any flash at.
-            own = next(
-                (
-                    item
-                    for item in (context.get("candidate_images") or ())
-                    if item.image_offset == candidate.image_offset
-                ),
-                None,
-            )
-            if own is not None and own.image_size:
-                start, size = own.image_offset, own.image_size
+        candidates = context.get("candidate_images") or []
+        entry_candidate = context.get("selected_entry_candidate")
 
-        placement = context.placement_for(
-            image_offset=start,
-            image_size=size,
-            runtime_base=base + start,
-            entry_structure=structure,
-            entry=context.get("entry"),
-            initial_stack_pointer=initial_sp,
-            confidence=context.get("base_confidence", 0.0) or 0.0,
-        )
-        context.provide("selected_placement", placement)
-        if start:
+        selected = self._choose(context, candidates, entry_candidate, base)
+        if selected is None:
+            # No candidate image at all: a single-image input the discovery
+            # pass had nothing to say about. Describing the whole input is
+            # then the only honest option, and it is still one object.
+            selected = ImageHypothesis(
+                architecture=context.backend.name,
+                placement=context.placement_for(
+                    image_offset=0,
+                    image_size=context.image.size,
+                    runtime_base=base,
+                    entry_structure_offset=(
+                        None if entry_candidate is None else entry_candidate.image_offset
+                    ),
+                    entry=context.get("entry"),
+                    initial_stack_pointer=(
+                        None
+                        if entry_candidate is None
+                        else entry_candidate.details.get("initial_sp")
+                    ),
+                    confidence=context.get("base_confidence", 0.0) or 0.0,
+                ),
+                details={"origin": "the whole input"},
+            )
+        elif selected.runtime_base is None:
+            selected = selected.rebased(base + selected.image_offset)
+        elif selected.runtime_base != base + selected.image_offset:
+            # The analyst or the reference evidence chose a different base.
+            # Move the image, all of it, rather than overwriting one field.
             context.note(
                 Evidence(
                     kind="placement",
                     source=self.name,
                     explanation=(
-                        f"the program occupies {size} bytes from file offset {start:#x}; "
-                        f"it loads at {placement.runtime_base:#010x}, and the bytes before it "
-                        "are not part of it"
+                        f"moving the selected image from {selected.runtime_base:#010x} to the "
+                        f"recovered base {base + selected.image_offset:#010x}"
                     ),
-                    value=placement.runtime_base,
+                    value=base,
+                    weight=0.0,
+                )
+            )
+            selected = selected.rebased(base + selected.image_offset)
+
+        # An analyst who supplies --entry knows something the bytes do not
+        # say. That is applied to the selected image rather than kept beside
+        # it, so there is still exactly one answer.
+        resolved_entry = context.get("entry")
+        if context.options.entry is not None or selected.entry is None:
+            selected = selected.with_entry(resolved_entry)
+
+        # An extent is inferred; an entry structure and an entry are read out
+        # of the image itself. When they disagree the extent gives way.
+        selected = selected.grown_to_contain(
+            selected.entry_structure,
+            None
+            if selected.entry is None
+            else context.backend.normalize_code_pointer(selected.entry),
+        )
+
+        context.provide("selected_image", selected)
+        context.provide("selected_placement", selected.placement)
+
+        # Everything downstream reads these, so they are *derived from* the
+        # selected image rather than standing alongside it. A later pass
+        # cannot disagree with the selection because there is nothing else to
+        # agree with.
+        if selected.entry is not None:
+            context.provide("entry", selected.entry)
+        context.provide(
+            "runtime_base", selected.runtime_base - selected.image_offset
+        )
+        context.provide("program_base", selected.runtime_base)
+
+        # Compared by where they are, not by object identity: the selected
+        # image is a moved copy of the one in this list by now.
+        others = [
+            item
+            for item in candidates
+            if item.image_size
+            and item.confidence >= 0.6
+            and not (
+                item.file_offset < selected.file_end
+                and selected.file_offset < item.file_offset + item.image_size
+            )
+        ]
+        if others and context.options.image is None:
+            # The ELF describes one program. If the input holds more than
+            # one, saying which was chosen -- and how to ask for the other --
+            # matters more than quietly reconstructing the first.
+            where = ", ".join(
+                f"{item.file_offset:#08x} ({item.image_size} bytes)" for item in others[:4]
+            )
+            context.warn(
+                f"this input holds {len(others) + 1} programs; reconstructing the one at "
+                f"file offset {selected.file_offset:#08x} ({selected.image_size} bytes). "
+                f"The other(s) are at {where} -- use --image to select one"
+            )
+
+        if selected.image_offset:
+            context.note(
+                Evidence(
+                    kind="placement",
+                    source=self.name,
+                    explanation=(
+                        f"the program occupies {selected.image_size} bytes from file offset "
+                        f"{selected.file_offset:#x} and loads at {selected.runtime_base:#010x}; "
+                        "the bytes before it are not part of it"
+                    ),
+                    value=selected.runtime_base,
                     weight=0.0,
                 )
             )
 
-        if not placement.consistent:
-            # Every number is individually defensible and the combination
-            # describes no image that exists. Say so rather than emit it.
-            context.warn(
-                f"the recovered entry {placement.entry:#010x} lies outside the image placed at "
-                f"{placement.runtime_base:#010x}..{placement.runtime_end:#010x}; "
-                "base and entry may have come from different images"
+    def _choose(self, context, candidates, entry_candidate, base):
+        """The candidate image the rest of the run describes.
+
+        The entry structure is what identifies it: an image is the thing its
+        own reset vector belongs to.
+        """
+        if not candidates:
+            return None
+
+        already = context.get("selected_image")
+        if already is not None:
+            # An explicit --image, or a carve. The choice is made.
+            return already
+
+        if len(context.image.segments) > 1 or context.image.addresses_declared:
+            # A container that describes its own layout -- Intel HEX, SREC --
+            # is not a dump with programs hidden in it. Every segment it
+            # declares is part of the program, so carving an extent out of
+            # one entry structure would throw the rest away.
+            return None
+
+        if entry_candidate is not None:
+            match = next(
+                (
+                    item
+                    for item in candidates
+                    if item.image_offset == entry_candidate.image_offset
+                ),
+                None,
             )
-            context.note(
-                Evidence(
-                    kind="placement",
-                    source=self.name,
-                    explanation=(
-                        "the recovered base, entry and entry structure do not describe "
-                        "one image"
-                    ),
-                    supports=False,
-                    weight=2.0,
-                )
-            )
+            if match is not None:
+                return match
+
+        # No entry structure to go on: the most credible image, which is what
+        # the candidate list is already ordered by.
+        return candidates[0]
 
     def _resolve_entry(self, context: AnalysisContext, base: int) -> None:
         options = context.options

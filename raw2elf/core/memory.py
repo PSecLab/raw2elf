@@ -33,6 +33,10 @@ class MemoryRegion:
     #: Inferred from values that were never dereferenced. Reported, so that
     #: nothing is silently discarded, but not treated as recovered memory.
     speculative: bool = False
+    #: For an established region, one chain of reasoning showing that an
+    #: instruction which touches it is really executed.  Every established
+    #: region has one; that is what "established" means.
+    trust_path: tuple[str, ...] = ()
     evidence: tuple[Evidence, ...] = ()
 
     @property
@@ -57,6 +61,7 @@ class MemoryRegion:
             "loadable": self.loadable,
             "speculative": self.speculative,
             "confidence": round(self.confidence, 3),
+            "trust_path": list(self.trust_path),
             "evidence": [item.explanation for item in self.evidence],
         }
 

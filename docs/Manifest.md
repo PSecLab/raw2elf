@@ -63,13 +63,14 @@ bumped only for an incompatible layout change.
 | `input` | Source path, detected format, the full detection ranking, byte counts, per-segment addresses, and any parser notes. |
 | `target` | Architecture, subarchitecture, instruction mode, endianness, pointer width, ELF machine number and flags — kept separate rather than collapsed into one string. |
 | `entry_structure` | The chosen entry structure: kind, file offset, image offset, runtime address, confidence. |
-| `placement` | The one tuple every later stage worked from — `file_offset`, `image_offset`, `image_size`, `runtime_base`, `entry_structure`, `entry`, `initial_stack_pointer`. Read this rather than reassembling the pieces. |
+| `placement` | The selected image, which every later stage worked from — `file_offset`, `image_offset`, `image_size`, `runtime_base`, `entry_structure` (plus the `entry_structure_offset` it derives from), `entry`, `initial_stack_pointer`. This is one of the objects in `images`, not a tuple assembled beside them; read it rather than reassembling the pieces. |
 | `architecture_candidates` | Every backend's probe confidence and details. |
 | `base_candidates` | Ranked load addresses, each with score, confidence, origin, and its evidence. |
 | `images` | Candidate firmware images found in the input, each with its own complete tuple: `runtime_base`, `entry`, `entry_structure` and `initial_stack_pointer`. |
 | `entry_candidates` | Every entry structure found, with its evidence. |
 | `regions` | Recovered memory map: type, bounds, size, permissions, confidence, evidence. Every region here rests on an observed memory access, a startup boundary or the reset stack pointer. |
 | `speculative_regions` | Ranges the evidence suggests but does not establish, in the same shape. Reported so nothing is discarded silently; not part of the recovered memory map, and never present in the ELF. |
+| `regions[].trust_path` | For an established region, the chain of reasoning showing that an instruction which touches it really executes — seed, call sites, block, instruction, access. Every established region has one. |
 | `elf_sections` | The allocated sections actually emitted. |
 | `padding` | Every detected padding run: offset, size, byte value. |
 | `references` | Totals by kind and by access, plus the `code`, `ram`, `flash_data` and `constants` reference lists. |
@@ -157,9 +158,12 @@ together is the quickest check on how much the run is claiming:
 }
 ```
 
-Every reference also carries `code_provenance` and `source_function`, saying
-why the instruction that produced it is believed to be code and which
-discovered function it belongs to. `by_provenance` totals the same references
+Every reference also carries `code_provenance`, `source_function` and
+`base_credible`. The first two say why the instruction that produced it is
+believed to be code and which discovered function it belongs to; the third says
+whether the value the address was *built from* could address memory at all. All
+three have to hold before a reference is evidence about memory — see
+[A reachable instruction can still compute a nonsense address](Recovery.md#a-reachable-instruction-can-still-compute-a-nonsense-address). `by_provenance` totals the same references
 that way. Only `ENTRY_POINT`, `DECLARED_HANDLER`, `DIRECT_CALL` and
 `VALIDATED_INDIRECT_CALL` are trusted; see
 [A decoded instruction is not executed code](Recovery.md#a-decoded-instruction-is-not-executed-code).

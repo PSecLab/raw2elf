@@ -390,7 +390,24 @@ def terminates_flow(instruction: "capstone.CsInsn") -> bool:
         return True
     if instruction.id == csarm.ARM_INS_UDF:
         return True
+    # Any other way of writing PC also ends the block. Continuing to decode
+    # past one walks into whatever follows -- usually a literal pool -- and
+    # then attributes those bytes the reachability of the code in front of
+    # them, which is exactly what must not happen.
+    if _writes_pc(instruction) and not is_conditional(instruction):
+        return True
     return False
+
+
+def _writes_pc(instruction: "capstone.CsInsn") -> bool:
+    """True when the instruction's destination operand is PC."""
+    operands = instruction.operands
+    if not operands:
+        return False
+    first = operands[0]
+    if first.type != csarm.ARM_OP_REG or first.reg != csarm.ARM_REG_PC:
+        return False
+    return bool(first.access & capstone.CS_AC_WRITE) if first.access else True
 
 
 def access_width(instruction: "capstone.CsInsn") -> Optional[int]:

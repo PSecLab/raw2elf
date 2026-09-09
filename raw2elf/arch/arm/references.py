@@ -237,13 +237,50 @@ def recover_accesses(
             _indirect_branch(instruction, state, recovery, classify, function, graph)
         for event in events:
             recovery.references.append(
-                _from_event(event, classify, function.provenance, start)
+                _from_event(
+                    event,
+                    classify,
+                    function.provenance,
+                    start,
+                    credible_base=context.backend.is_credible_base,
+                )
             )
         if function.order:
             last = function.order[-1]
             recovery.code_regions.append(
                 (function.start, last + function.instructions[last].size - function.start)
             )
+
+    # An indirect call whose target was recovered *and* whose caller is itself
+    # reached is a real control-flow edge, so the target is code. Unresolved
+    # indirect branches create no successor at all, which is why this list
+    # only ever holds targets a value actually reached.
+    if recovery.validated_targets:
+        before = set(graph.functions)
+        graph.discover(recovery.validated_targets)
+        for start in set(graph.functions) - before:
+            function = graph.functions[start]
+            semantics = ThumbSemantics(function, lattice, context.read_word)
+            states, first_states = semantics.run()
+            recovery.states[start] = states
+            recovery.first_states[start] = first_states
+            recovery.predecessors[start] = semantics.predecessors()
+            events: list = []
+            for address in function.order:
+                state = states.get(address)
+                if state is None:
+                    continue
+                semantics.apply(function.instructions[address], state.copy(), sink=events)
+            for event in events:
+                recovery.references.append(
+                    _from_event(
+                        event,
+                        classify,
+                        function.provenance,
+                        start,
+                        credible_base=context.backend.is_credible_base,
+                    )
+                )
     return recovery
 
 
@@ -252,8 +289,17 @@ def _from_event(
     classify: Callable[[int], AddressClass],
     provenance: CodeProvenance = CodeProvenance.LINEAR_SWEEP,
     function_start: Optional[int] = None,
+    credible_base: Optional[Callable[[int], bool]] = None,
 ) -> Reference:
     address_class = classify(event.address)
+    # An address built by indexing a register that held a loop counter is a
+    # displacement, not a pointer. Asking whether the *base* could address
+    # memory is the only way to tell from here.
+    base = event.base_value
+    if credible_base is None or base is None:
+        base_credible = True
+    else:
+        base_credible = credible_base(base)
     if event.derivation == "pc-relative literal":
         # Loading a value says nothing about what it is. Classification waits
         # for something to use it as an address.
@@ -281,6 +327,7 @@ def _from_event(
         address_class=address_class,
         code_provenance=provenance,
         source_function=function_start,
+        base_credible=base_credible,
     )
 
 

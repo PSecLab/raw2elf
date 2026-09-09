@@ -346,6 +346,23 @@ class Shell(cmd.Cmd):
             listing = console.base_candidates(result)
             self.say(listing or "  nothing to weigh")
             return
+        if subject in ("trusted", "reachable", "provenance"):
+            # "Why do we believe this instruction executes?", for each thing
+            # the run is prepared to call recovered memory.
+            memory = result.context.get("memory_map")
+            shown = False
+            for region in (memory.established if memory else []):
+                if not region.trust_path:
+                    continue
+                shown = True
+                self.say(
+                    f"  {region.name} 0x{region.start:08x}-0x{region.end:08x}"
+                )
+                for step in region.trust_path:
+                    self.say(self.paint.dim(f"       {step}"))
+            if not shown:
+                self.say(self.paint.dim("  no region rests on a traced instruction"))
+            return
         matches = [
             item
             for item in result.context.evidence
@@ -359,7 +376,7 @@ class Shell(cmd.Cmd):
 
     def complete_why(self, text, line, begin, end):
         """Complete from the words the evidence actually used this run."""
-        words = {"base"}
+        words = {"base", "trusted", "reachable", "provenance"}
         if self.reconstruction is not None:
             words |= {item.kind.lower() for item in self.reconstruction.context.evidence}
         return sorted(word for word in words if word.startswith(text))
@@ -439,10 +456,17 @@ class Shell(cmd.Cmd):
     def _show_regions(self, result) -> None:
         memory = result.context.get("memory_map")
         for region in memory or []:
+            standing = (
+                self.paint.dim(f"  speculative ({region.confidence:.2f})")
+                if region.speculative
+                else ""
+            )
             self.say(
                 f"  {region.kind.value:<6} 0x{region.start:08x}-0x{region.end:08x}  "
-                f"{_size(region.size):>8}  {region.name}"
+                f"{_size(region.size):>8}  {region.name}{standing}"
             )
+            for step in region.trust_path:
+                self.say(self.paint.dim(f"           {step}"))
 
     def _show_startup(self, result) -> None:
         state = result.context.get("startup_state")

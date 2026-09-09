@@ -7,7 +7,7 @@ is made once, explicitly, against a confidence threshold.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional
 
 from .evidence import Evidence, confidence_label
@@ -125,12 +125,38 @@ class ImageHypothesis:
         return self.placement.initial_stack_pointer
 
     @property
+    def file_end(self) -> int:
+        return self.placement.file_end
+
+    @property
     def confidence(self) -> float:
         return self.placement.confidence
 
     @property
     def label(self) -> str:
         return confidence_label(self.confidence)
+
+    # -- deriving another view of the *same* image ------------------------
+
+    def rebased(self, runtime_base: int) -> "ImageHypothesis":
+        """This image placed at a different load address, moving as one.
+
+        Every address-valued field moves together, so a rebase cannot leave
+        the entry belonging to one address and the table to another.
+        """
+        return replace(self, placement=self.placement.rebased(runtime_base))
+
+    def at_image_offset(self, image_offset: int) -> "ImageHypothesis":
+        """This image described in another image-offset coordinate system."""
+        return replace(self, placement=self.placement.at_image_offset(image_offset))
+
+    def with_entry(self, entry: Optional[int]) -> "ImageHypothesis":
+        """This image with an analyst-supplied entry point applied."""
+        return replace(self, placement=self.placement.with_entry(entry))
+
+    def grown_to_contain(self, *addresses: Optional[int]) -> "ImageHypothesis":
+        """This image, extended so its own facts fall inside it."""
+        return replace(self, placement=self.placement.grown_to_contain(*addresses))
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -155,6 +181,24 @@ class RecoveryRefused(RuntimeError):
     subject: str = ""
     #: Set by the driver once the run unwinds; ``None`` if unavailable.
     context: Any = None
+
+
+class InconsistentPlacementError(RecoveryRefused):
+    """Raised when the numbers describing the selected image disagree.
+
+    An ELF built from a base belonging to one image and an extent belonging
+    to another is worse than no ELF: it loads, it disassembles, and it is
+    wrong in a way nothing downstream can detect.  So this refuses instead.
+    """
+
+    def __init__(self, problems: list[str]) -> None:
+        self.subject = "image placement"
+        self.problems = problems
+        joined = "; ".join(problems)
+        super().__init__(
+            f"refusing to write an ELF: the selected image is not internally "
+            f"consistent ({joined})"
+        )
 
 
 class AmbiguityError(RecoveryRefused):

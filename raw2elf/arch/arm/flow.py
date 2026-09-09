@@ -60,15 +60,32 @@ class Function:
     start: int
     instructions: dict[int, "object"] = field(default_factory=dict)
     order: list[int] = field(default_factory=list)
-    calls: set[int] = field(default_factory=set)
+    #: Direct-call targets, each mapped to the call site that reached it.
+    calls: dict[int, int] = field(default_factory=dict)
     #: Addresses that are the target of a backward branch, i.e. loop heads.
     loop_headers: set[int] = field(default_factory=set)
     #: Why these bytes are believed to be code at all.
     provenance: CodeProvenance = CodeProvenance.LINEAR_SWEEP
+    #: How this function came to be walked: the function that reached it and
+    #: the instruction that did so.  ``None`` for a seed.
+    reached_from: Optional[tuple[int, int]] = None
+    #: Start address of each basic block walked, and for each the instruction
+    #: that gave control to it.  The unit of trust is the block, not the
+    #: address interval the function happens to span: a function's first and
+    #: last instruction can be thousands of bytes apart with data in between,
+    #: and nothing in that gap is reachable merely for being inside it.
+    blocks: dict[int, Optional[int]] = field(default_factory=dict)
 
     @property
     def trusted(self) -> bool:
         return self.provenance.trusted
+
+    def block_of(self, address: int) -> Optional[int]:
+        """The block an instruction belongs to, if it was walked at all."""
+        if address not in self.instructions:
+            return None
+        starts = [start for start in self.blocks if start <= address]
+        return max(starts) if starts else None
 
     @property
     def size(self) -> int:
@@ -119,6 +136,8 @@ class CodeGraph:
         wavefront.sort(key=lambda item: item[1].rank)
 
         seen_seeds: dict[int, CodeProvenance] = {}
+        #: target -> (caller function, call site), for the audit trail
+        reached: dict[int, tuple[int, int]] = {}
         pending: list[tuple[int, CodeProvenance]] = list(reversed(wavefront))
         while pending:
             start, provenance = pending.pop()
@@ -130,27 +149,43 @@ class CodeGraph:
             if self.instruction_count >= self.max_instructions:
                 self.exhausted = True
                 break
-            function = self._walk(start, provenance)
+            function = self._walk(start, provenance, reached_from=reached.get(start))
             if function is None or not function.instructions:
                 continue
             self.functions[start] = function
             inherited = provenance.demoted_to(CodeProvenance.DIRECT_CALL)
-            for target in function.calls:
+            for target, site in function.calls.items():
+                # A direct call is followed only because the call instruction
+                # itself was walked, so the callee is reachable exactly when
+                # the caller's block was.
                 if seen_seeds.get(target, CodeProvenance.DATA_DECODE).rank > inherited.rank:
                     pending.append((target, inherited))
+                    reached.setdefault(target, (start, site))
             # Keep the queue in trust order: a newly found trusted callee
             # should be walked before the sweep's leftover guesses.
             pending.sort(key=lambda item: item[1].rank, reverse=True)
         return self.functions
 
     def _walk(
-        self, start: int, provenance: CodeProvenance = CodeProvenance.LINEAR_SWEEP
+        self,
+        start: int,
+        provenance: CodeProvenance = CodeProvenance.LINEAR_SWEEP,
+        reached_from: Optional[tuple[int, int]] = None,
     ) -> Optional[Function]:
-        """Linearly decode one function, following its internal branches."""
-        function = Function(start=start, provenance=provenance)
-        worklist = [start]
+        """Decode one function block by block, following only real edges.
+
+        Each item on the worklist starts a basic block.  Decoding runs to the
+        end of that block and stops: at an unconditional branch, a return, a
+        table branch, an undefined instruction or any other write to PC.
+        Falling out of a block into the bytes that follow it is how a literal
+        pool acquires the reachability of the code in front of it.
+        """
+        function = Function(start=start, provenance=provenance, reached_from=reached_from)
+        worklist: list[tuple[int, Optional[int]]] = [(start, None)]
         while worklist:
-            address = worklist.pop()
+            address, arrived_from = worklist.pop()
+            if address not in function.instructions:
+                function.blocks.setdefault(address, arrived_from)
             while True:
                 if address in function.instructions or address in self.visited:
                     break
@@ -171,12 +206,14 @@ class CodeGraph:
                 target = branch_target(instruction)
                 if target is not None:
                     if is_call(instruction):
-                        function.calls.add(target & ~1)
+                        function.calls.setdefault(target & ~1, address)
                     else:
                         if target <= address:
                             function.loop_headers.add(target)
                         if target not in function.instructions:
-                            worklist.append(target)
+                            # A branch target begins a block, whether the
+                            # branch was conditional or not.
+                            worklist.append((target, address))
                 if terminates_flow(instruction):
                     break
                 address += instruction.size

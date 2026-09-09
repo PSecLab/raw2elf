@@ -24,6 +24,7 @@ def summary(reconstruction: Reconstruction, outputs: Sequence[str] = ()) -> str:
     target = reconstruction.backend.elf_target_info()
     base = context.get("runtime_base")
     entry = context.get("entry")
+    verbose = context.options.verbose > 0
     candidate = context.get("selected_entry_candidate")
     references = context.get("references")
     accesses = context.get("mmio_accesses") or []
@@ -130,6 +131,15 @@ def summary(reconstruction: Reconstruction, outputs: Sequence[str] = ()) -> str:
                 f"  {human_size(region.size):>7}  {region.name}"
                 f"   speculative ({region.confidence:.2f})"
             )
+        if verbose and any(region.trust_path for region in memory_map.established):
+            lines.append("")
+            lines.append("Why those regions are believed:")
+            for region in memory_map.established:
+                if not region.trust_path:
+                    continue
+                lines.append(f"  {region.name} 0x{region.start:08x}:")
+                for step in region.trust_path:
+                    lines.append(f"      {step}")
 
     if startup is not None and startup.initializations:
         lines.append("")

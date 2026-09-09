@@ -163,6 +163,14 @@ class ImageDiscovery(AnalysisPass):
             )
         chosen = hypotheses[selection]
         context.image = context.root_image.subimage(chosen.image_offset, chosen.image_size)
+
+        # Offsets restart at zero in the carved image, so the hypotheses have
+        # to be re-expressed in its coordinates or a later lookup by offset
+        # will match the wrong image. The selected image is the only one that
+        # still exists here, and it is the same object, moved -- not a new one
+        # assembled from its fields.
+        chosen = chosen.at_image_offset(0)
+        context.provide("candidate_images", [chosen])
         context.provide("selected_image", chosen)
         context.note(
             Evidence(
@@ -259,8 +267,12 @@ class ImageDiscovery(AnalysisPass):
                 (item for item in boundaries if item > offset),
                 image.size,
             )
-            end = self._trim(offset, following, padding)
-            size = max(end - offset, 0)
+            # An erased tail is not part of the program, unless the analyst
+            # asked to keep every byte -- in which case the image's extent
+            # has to include it, or the ELF and the reported extent disagree.
+            if context.options.extra.get("trim_padding", True):
+                following = self._trim(offset, following, padding)
+            size = max(following - offset, 0)
 
             # An image's runtime base is where *that image* loads, not where
             # the dump around it loads. The backend's seeds are expressed as
@@ -276,7 +288,7 @@ class ImageDiscovery(AnalysisPass):
                 image_offset=offset,
                 image_size=size,
                 runtime_base=own_base,
-                entry_structure=own_base,
+                entry_structure_offset=offset,
                 entry=candidate.entry_value,
                 initial_stack_pointer=candidate.details.get("initial_sp"),
                 confidence=candidate.confidence,
